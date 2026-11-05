@@ -5,8 +5,11 @@
 
 #include "nvkmd_nvrm.h"
 
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 
+#include "util/macros.h"
 #include "util/os_misc.h"
 #include "util/u_memory.h"
 #include "vk_log.h"
@@ -184,6 +187,80 @@ static uint32_t sUsermodeClasses[] = {
 };
 
 
+/*
+ * Shader model for a chipset, mirroring sm_for_chipset() in
+ * winsys/nouveau_device.c for the Turing+ chips NVIDIA RM supports.
+ *
+ * NAK's instruction encoding and latency tables are keyed on this value, so
+ * it must agree with what the nouveau path uses. RM's
+ * NV0080_CTRL_GR_INFO_INDEX_SM_VERSION is not trusted on its own: the 570.x
+ * SDK defines no SM 12.0 value at all (it first appears in 575.51.02), so
+ * GB20x may report a version NAK would compile for incorrectly.
+ * Returns 0 for chipsets this table doesn't know.
+ */
+static uint8_t
+nvkmd_nvrm_sm_for_chipset(uint16_t chipset)
+{
+   if (chipset >= 0x1b0)
+      return 120; /* GB20x */
+   else if (chipset >= 0x1a0)
+      return 100; /* GB10x */
+   else if (chipset >= 0x190)
+      return 89;  /* AD10x */
+   else if (chipset >= 0x180)
+      return 90;  /* GH100 */
+   else if (chipset == 0x17b)
+      return 87;
+   else if (chipset >= 0x172)
+      return 86;
+   else if (chipset >= 0x170)
+      return 80;
+   else if (chipset >= 0x160)
+      return 75;  /* TU10x */
+   return 0;
+}
+
+/*
+ * Mirrors max_warps_per_mp_for_sm() in winsys/nouveau_device.c for Turing+.
+ * Returns 0 when unknown.
+ */
+static uint8_t
+nvkmd_nvrm_max_warps_per_mp_for_sm(uint8_t sm)
+{
+   switch (sm) {
+   case 75:
+      return 32;
+   case 86:
+   case 87:
+   case 89:
+   case 120:
+      return 48;
+   case 80:
+   case 90:
+   case 100:
+   case 104:
+      return 64;
+   default:
+      return 0;
+   }
+}
+
+/*
+ * NVK sizes shader local memory (TLS) from warps-per-SM and SMs-per-TPC:
+ * an under-estimate makes threads' scratch overlap, an over-estimate only
+ * wastes memory. Take the larger of RM's value and nouveau's table.
+ */
+static uint32_t
+nvkmd_nvrm_pick_max(const char *what, uint32_t rmValue, uint32_t tableValue)
+{
+   if (tableValue != 0 && tableValue != rmValue) {
+      fprintf(stderr, "nvk/nvrm: RM reports %s %u, nouveau table says %u; "
+              "using %u\n", what, rmValue, tableValue,
+              MAX2(rmValue, tableValue));
+   }
+   return MAX2(rmValue, tableValue);
+}
+
 static int
 compare_uint32(const void* a, const void* b)
 {
@@ -332,10 +409,33 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
 	uint64_t vramSize = fbGetInfoParams.fbInfoList[0].data * (uint64_t)1024;
 	uint64_t bar1Size = fbGetInfoParams.fbInfoList[1].data * (uint64_t)1024;
 
+   const uint16_t chipset = archInfoParams.architecture | archInfoParams.implementation;
+   const uint8_t rmSm = (smVersion >> 8) * 10 + (smVersion & 0xf);
+   const uint8_t tableSm = nvkmd_nvrm_sm_for_chipset(chipset);
+   const uint8_t sm = tableSm != 0 ? tableSm : rmSm;
+   if (tableSm != 0 && tableSm != rmSm) {
+      fprintf(stderr, "nvk/nvrm: RM reports SM version %#x for chipset %#x; "
+              "using SM %u to match the nouveau path\n",
+              smVersion, chipset, sm);
+   }
+   const uint32_t warpsPerSm = nvkmd_nvrm_pick_max("max warps per SM",
+      maxWarpsPerSm, nvkmd_nvrm_max_warps_per_mp_for_sm(sm));
+   /* Volta and newer have two SMs per TPC. */
+   const uint32_t smPerTpc = nvkmd_nvrm_pick_max("SMs per TPC",
+      litterNumSmPerTpc, chipset >= 0x140 ? 2 : 0);
+   if (getenv("NVK_NVRM_DEBUG") != NULL) {
+      fprintf(stderr, "nvk/nvrm: device %04x chipset %#x sm %u (rm %#x) "
+              "gpcs %u tpcs %u sm/tpc %u warps/sm %u vram %" PRIu64 " MiB "
+              "bar1 %" PRIu64 " MiB\n",
+              ci->pci_info.device_id, chipset, sm, smVersion, gpcCount,
+              tpcCount, smPerTpc, warpsPerSm,
+              vramSize >> 20, bar1Size >> 20);
+   }
+
    pdev->base.dev_info = (struct nv_device_info) {
     .type = NV_DEVICE_TYPE_DIS,
     .device_id = ci->pci_info.device_id,
-    .chipset = archInfoParams.architecture | archInfoParams.implementation,
+    .chipset = chipset,
     .pci = {
         .domain = ci->pci_info.domain,
         .bus = ci->pci_info.bus,
@@ -343,11 +443,11 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
         .func = 0,
         .revision_id = 255
     },
-    .sm = (smVersion >> 8) * 10 + (smVersion & 0xf),
+    .sm = sm,
     .gpc_count = gpcCount,
     .tpc_count = tpcCount,
-    .mp_per_tpc = litterNumSmPerTpc,
-    .max_warps_per_mp = maxWarpsPerSm,
+    .mp_per_tpc = smPerTpc,
+    .max_warps_per_mp = warpsPerSm,
     .cls_copy    = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelCopyClasses), sSubchannelCopyClasses),
     .cls_eng2d   = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelEng2dClasses), sSubchannelEng2dClasses),
     .cls_eng3d   = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelEng3dClasses), sSubchannelEng3dClasses),
