@@ -1,3 +1,16 @@
+.. note::
+
+   **Haiku / NVIDIA RM fork.** Branch ``rtx5070-dev`` is X547's ``mesa-nvk-r2``
+   (NVK with a backend in ``src/nouveau/vulkan/nvkmd/nvrm`` that talks to
+   NVIDIA's Resource Manager on Haiku instead of nouveau) plus a fix for
+   Blackwell GPUs such as the GeForce RTX 5070: the shader model now comes
+   from the chipset, as on the nouveau path, rather than from RM alone, and
+   ``NVK_NVRM_DEBUG=1`` prints the device description NVK uses.
+
+   It is built as part of `nvidia-haiku <https://github.com/Techniix/nvidia-haiku>`_,
+   which also links the NVIDIA headers it needs. The rest of this file is
+   Mesa's own README.
+
 `Mesa <https://mesa3d.org>`_ - The 3D Graphics Library
 ======================================================
 
