@@ -27,6 +27,8 @@ nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
 
    dev->base.ops = &nvkmd_nvrm_dev_ops;
    dev->base.pdev = &pdev->base;
+   dev->base.va_start = NVKMD_NVRM_VA_START;
+   dev->base.va_end = NVKMD_NVRM_VA_END;
 
    list_inithead(&dev->base.mems);
    simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
