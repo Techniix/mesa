@@ -47,17 +47,29 @@ nvkmd_nvrm_alloc_va(struct nvkmd_dev *_dev,
    va->base.size_B = size_B;
    util_dynarray_init(&va->bound, NULL);
 
+	/* Keep every allocation above the shader memory windows. NVK puts the
+	 * compute local memory window at 0xff000000 and, on Hopper and later, the
+	 * shared memory window at 4 GiB (nvk_cmd_dispatch.c, nvk_cmd_draw.c), and
+	 * relies on nothing being mapped there. The nouveau backend allocates
+	 * from the top of its heap, so it never gets near them; RM allocates
+	 * from the bottom of the VA space, so once enough memory is in use a
+	 * buffer lands inside a window. A shader that then reads or writes that
+	 * buffer (NVK's own query copy shader, for one) dies with an SM warp
+	 * exception, "Invalid Address Space", and the channel stops. */
 	NvHandle hMemoryVirt = 0;
 	NV_MEMORY_ALLOCATION_PARAMS params = {
 		.owner = pdev->hClient,
 		.type = NVOS32_TYPE_IMAGE,
 		.flags =
 			NVOS32_ALLOC_FLAGS_VIRTUAL |
+			NVOS32_ALLOC_FLAGS_USE_BEGIN_END |
 			((align_B != 0) ? NVOS32_ALLOC_FLAGS_ALIGNMENT_FORCE : 0) |
 			/* Sparse residency: unmapped pages must be non-faulting (read as
 			 * zero) rather than raising a GPU page fault, and UNMAP restores
 			 * that sparse PTE instead of a faulting hole. */
 			((flags & NVKMD_VA_SPARSE) ? NVOS32_ALLOC_FLAGS_SPARSE : 0),
+		.rangeLo = NVKMD_NVRM_VA_START,
+		.rangeHi = NVKMD_NVRM_VA_END - 1,
 		.size = size_B,
 		.alignment = align_B,
 		.hVASpace = pdev->hVaSpace,
