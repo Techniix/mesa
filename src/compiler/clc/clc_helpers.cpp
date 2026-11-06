@@ -68,6 +68,10 @@
 #include <llvm/Support/VirtualFileSystem.h>
 #endif
 
+#if LLVM_VERSION_MAJOR >= 22
+#include <clang/Options/OptionUtils.h>
+#endif
+
 #include "util/macros.h"
 #include "util/u_dl.h"
 #include "glsl_types.h"
@@ -866,8 +870,13 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
    // http://www.llvm.org/bugs/show_bug.cgi?id=19735
    c->getDiagnosticOpts().ShowCarets = false;
 
+#if LLVM_VERSION_MAJOR >= 22
+   // LLVM 22 dropped the VFS parameter: createDiagnostics() now uses the
+   // instance's VFS, which starts out unset.
+   c->setVirtualFileSystem(llvm::vfs::getRealFileSystem());
+#endif
    c->createDiagnostics(
-#if LLVM_VERSION_MAJOR >= 20
+#if LLVM_VERSION_MAJOR >= 20 && LLVM_VERSION_MAJOR < 22
                    *llvm::vfs::getRealFileSystem(),
 #endif
                    new clang::TextDiagnosticPrinter(
@@ -915,7 +924,10 @@ clc_compile_to_llvm_module(LLVMContext &llvm_ctx,
    // GetResourcePath is a way to retrieve the actual libclang resource dir based on a given binary
    // or library.
    auto tmp_res_path =
-#if LLVM_VERSION_MAJOR >= 20
+#if LLVM_VERSION_MAJOR >= 22
+      // Moved out of clang::driver::Driver in LLVM 22.
+      clang::GetResourcesPath(std::string(clang_path));
+#elif LLVM_VERSION_MAJOR >= 20
       Driver::GetResourcesPath(std::string(clang_path));
 #else
       Driver::GetResourcesPath(std::string(clang_path), CLANG_RESOURCE_DIR);
@@ -1152,7 +1164,12 @@ llvm_mod_to_spirv(std::unique_ptr<::llvm::Module> mod,
    if (args->use_llvm_spirv_target) {
       const char *triple = args->address_bits == 32 ? "spirv-unknown-unknown" : "spirv64-unknown-unknown";
       std::string error_msg("");
+#if LLVM_VERSION_MAJOR >= 21
+      // The string overload is gone in LLVM 23; the Triple one exists since 21.
+      auto target = TargetRegistry::lookupTarget(llvm::Triple(triple), error_msg);
+#else
       auto target = TargetRegistry::lookupTarget(triple, error_msg);
+#endif
       if (target) {
          auto TM = target->createTargetMachine(
 #if LLVM_VERSION_MAJOR >= 21
