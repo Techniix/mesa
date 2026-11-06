@@ -17,6 +17,14 @@
 #include "nvtypes.h"
 #include "ctrl/ctrl2080/ctrl2080fb.h" // NV2080_CTRL_CMD_FB_GET_SEMAPHORE_SURFACE_LAYOUT
 
+/* The part of the GPU's VA space NVK's buffers go in. It starts above 8 GiB
+ * so nothing is ever mapped under the shader local and shared memory windows
+ * NVK places at 0xff000000 and (Hopper and later) 4 GiB; see
+ * nvkmd_nvrm_alloc_va(). It ends where the nouveau backend's does.
+ */
+#define NVKMD_NVRM_VA_START (1ull << 33)
+#define NVKMD_NVRM_VA_END   (1ull << 39)
+
 struct nvrm_ws_bo;
 struct nvrm_ws_context;
 struct nvrm_ws_device;
