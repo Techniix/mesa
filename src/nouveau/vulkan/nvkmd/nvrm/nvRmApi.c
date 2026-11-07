@@ -1,6 +1,9 @@
 #include "nvRmApi.h"
 
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <pthread.h>
 #include <errno.h>
 #include <string.h>
 #include <fcntl.h>
@@ -16,11 +19,74 @@
 #include "nv-unix-nvos-params-wrappers.h"
 #include "nvstatus.h"
 #ifdef __HAIKU__
+#include <OS.h>
 #include "nv-haiku.h"
 #endif
 
 
+/*
+ * NVK_NVRM_TRACE=<file>: append one line before and one after every RM ioctl,
+ * each flushed to disk with fsync(), so the last call made before a hard
+ * system hang survives a power cycle. Debugging aid; slow when enabled.
+ */
+static int sTraceFd = -1;
+static pthread_once_t sTraceOnce = PTHREAD_ONCE_INIT;
+
+static void nvRmTraceInit(void)
+{
+	const char *path = getenv("NVK_NVRM_TRACE");
+	if (path != NULL && path[0] != '\0')
+		sTraceFd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+}
+
+static void nvRmTrace(const char *fmt, ...)
+{
+	char line[192];
+	va_list ap;
+	va_start(ap, fmt);
+	int len = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (len <= 0)
+		return;
+	if (len >= (int)sizeof(line))
+		len = sizeof(line) - 1;
+	ssize_t written = write(sTraceFd, line, len);
+	(void)written;
+	fsync(sTraceFd);
+}
+
+static long nvRmTraceThread(void)
+{
+#ifdef __HAIKU__
+	return (long)find_thread(NULL);
+#else
+	return 0;
+#endif
+}
+
+static int nvRmIoctlImpl(int fd, NvU32 cmd, void *pParams, NvU32 paramsSize);
+
 static int nvRmIoctl(int fd, NvU32 cmd, void *pParams, NvU32 paramsSize)
+{
+	pthread_once(&sTraceOnce, nvRmTraceInit);
+	if (sTraceFd < 0)
+		return nvRmIoctlImpl(fd, cmd, pParams, paramsSize);
+
+	/* For allocs and controls, also log the class or control command. */
+	NvU32 detail = 0;
+	if (cmd == NV_ESC_RM_ALLOC && paramsSize >= sizeof(NVOS21_PARAMETERS))
+		detail = ((NVOS21_PARAMETERS *)pParams)->hClass;
+	else if (cmd == NV_ESC_RM_CONTROL && paramsSize >= sizeof(NVOS54_PARAMETERS))
+		detail = ((NVOS54_PARAMETERS *)pParams)->cmd;
+
+	nvRmTrace("> thr %ld fd %d esc %u detail %#x size %u\n",
+	          nvRmTraceThread(), fd, cmd, detail, paramsSize);
+	int res = nvRmIoctlImpl(fd, cmd, pParams, paramsSize);
+	nvRmTrace("< thr %ld esc %u res %d\n", nvRmTraceThread(), cmd, res);
+	return res;
+}
+
+static int nvRmIoctlImpl(int fd, NvU32 cmd, void *pParams, NvU32 paramsSize)
 {
 	int res;
 	do {
