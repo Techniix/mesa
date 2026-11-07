@@ -232,6 +232,25 @@ write_semaphore_acquire(struct nv_push *push, uint64_t adrGpu, uint64_t value)
    });
 }
 
+uint64_t
+nvkmd_nvrm_channel_completed(const struct nvkmd_nvrm_channel *chan)
+{
+	return *(volatile uint64_t *)chan->sem->map;
+}
+
+uint64_t
+nvkmd_nvrm_channel_retire_point(const struct nvkmd_nvrm_channel *chan)
+{
+	/* Methods already in the push but not yet submitted will be retired by
+	 * the next fence. Read the push before wSeq: nvrm_channel_submit()
+	 * publishes the new wSeq before resetting the push, so a concurrent
+	 * submit can make this one fence too high, never too low. */
+	bool unsubmitted = nv_push_dw_count(&chan->push) > 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	uint64_t submitted = __atomic_load_n(&chan->wSeq, __ATOMIC_ACQUIRE);
+	return unsubmitted ? submitted + 1 : submitted;
+}
+
 static void
 nvrm_channel_finish(struct nvkmd_nvrm_dev *dev, struct nvkmd_nvrm_channel *chan)
 {
@@ -245,6 +264,13 @@ nvrm_channel_finish(struct nvkmd_nvrm_dev *dev, struct nvkmd_nvrm_channel *chan)
       close(chan->osEvent);
    if (chan->hChannel != 0)
       nvRmApiFree(&rm, chan->hChannel);
+
+   /* The channel is gone, so none of its work can touch a sync slot any more:
+    * stop deferring slot reuse on it. Must come before chan->sem is released,
+    * which the slot pool reads while the channel is registered. No-op for a
+    * channel that never finished init (never registered). */
+   nvkmd_nvrm_sync_unregister_channel(dev, chan);
+
    if (chan->hCtxDma != 0)
       nvRmApiFree(&rm, chan->hCtxDma);
    if (chan->sem != NULL)
@@ -362,6 +388,13 @@ nvrm_channel_init(struct nvkmd_nvrm_dev *dev,
 
    chan_begin_slot(chan);
 
+   /* From here on its SEM methods may name sync-pool slots. An untracked
+    * channel would let slots be reused under it, so fail instead. */
+   if (!nvkmd_nvrm_sync_register_channel(dev, chan)) {
+      vkRes = vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+      goto error;
+   }
+
    return VK_SUCCESS;
 
 error:
@@ -386,7 +419,9 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
    KeplerBControlGPFifo *userD = chan->userD->map;
    uint64_t semAdrGpu = chan->sem->va->addr;
 
-   chan->wSeq++;
+   /* Published before the push is reset (chan_begin_slot below); see
+    * nvkmd_nvrm_channel_retire_point(). */
+   __atomic_store_n(&chan->wSeq, chan->wSeq + 1, __ATOMIC_RELEASE);
 
    /* Channel fence: the drained-state marker the slot-recycle wait polls on. */
    write_semaphore_release(&chan->push, semAdrGpu, chan->wSeq, true);

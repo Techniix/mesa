@@ -35,6 +35,8 @@ nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
    simple_mtx_init(&dev->sync_mutex, mtx_plain);
    util_dynarray_init(&dev->sync_pages, NULL);
    util_dynarray_init(&dev->sync_events, NULL);
+   util_dynarray_init(&dev->sync_channels, NULL);
+   util_dynarray_init(&dev->sync_retiring, NULL);
 
    dev->mappings = _mesa_hash_table_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
    if (dev->mappings == NULL) {

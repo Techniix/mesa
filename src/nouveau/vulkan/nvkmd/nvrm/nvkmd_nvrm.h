@@ -78,6 +78,12 @@ struct nvkmd_nvrm_dev {
     * wait need not open/alloc/free an OS event every time. Guarded by
     * sync_mutex. */
    struct util_dynarray sync_events;  /* struct nvkmd_nvrm_sync_event */
+   /* Channels that can access pool slots (every exec and bind channel), and
+    * freed slots waiting for those channels to retire the work that may still
+    * use them (see nvkmd_nvrm_retire.h). Both guarded by sync_mutex. */
+   struct util_dynarray sync_channels;  /* struct nvkmd_nvrm_channel * */
+   struct util_dynarray sync_retiring;  /* struct nvrm_retire_entry * */
+   bool sync_retire_reported;
 };
 
 NVKMD_DECL_SUBCLASS(dev, nvrm);
@@ -284,6 +290,19 @@ nvkmd_nvrm_sync_cpu_signal(struct vk_sync *sync, uint64_t value);
  * nvkmd_nvrm_sync.c) so the payload is monotonic and a post-submit reset can
  * never lower it beneath an in-flight acquire. */
 uint64_t nvkmd_nvrm_sync_gpu_addr(struct vk_sync *sync);
+
+struct nvkmd_nvrm_channel;
+/* Register/unregister a channel whose host SEM methods may name sync-pool
+ * slots, so freed slots are not reused while it may still access them.
+ * Registration fails only when out of memory. */
+bool nvkmd_nvrm_sync_register_channel(struct nvkmd_nvrm_dev *dev,
+                                      struct nvkmd_nvrm_channel *chan);
+void nvkmd_nvrm_sync_unregister_channel(struct nvkmd_nvrm_dev *dev,
+                                        struct nvkmd_nvrm_channel *chan);
+/* The channel fence it has completed, and the fence by which it will have
+ * executed everything emitted so far (submitted or still in its push). */
+uint64_t nvkmd_nvrm_channel_completed(const struct nvkmd_nvrm_channel *chan);
+uint64_t nvkmd_nvrm_channel_retire_point(const struct nvkmd_nvrm_channel *chan);
 uint64_t nvkmd_nvrm_sync_gpu_signal_value(struct vk_sync *sync, uint64_t value);
 uint64_t nvkmd_nvrm_sync_gpu_wait_value(struct vk_sync *sync, uint64_t value);
 

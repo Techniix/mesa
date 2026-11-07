@@ -4,6 +4,7 @@
  */
 
 #include "nvkmd_nvrm.h"
+#include "nvkmd_nvrm_retire.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -130,12 +131,118 @@ sync_pool_slots_per_page(void)
    return 0x1000 / NVRM_SYNC_SLOT_SIZE;
 }
 
+/* What a retire entry frees once its channels have retired (entry->kind). */
+enum {
+   SYNC_RETIRE_POOL_SLOT,  /* a pool slot: back to its page's free bitmap */
+   SYNC_RETIRE_MEM_UNREF,  /* a dedicated sync's memory: drop our reference */
+};
+
+/* Return a slot to its page's free bitmap. Caller holds sync_mutex. */
+static void
+sync_pool_release_slot_locked(struct nvkmd_nvrm_dev *dev,
+                              struct nvkmd_mem *mem, uint64_t offset)
+{
+   uint32_t slot = (uint32_t)(offset / NVRM_SYNC_SLOT_SIZE);
+
+   util_dynarray_foreach(&dev->sync_pages, struct nvkmd_nvrm_sync_page *, it) {
+      struct nvkmd_nvrm_sync_page *page = *it;
+      if (page->mem == mem) {
+         assert(page->bitmap[slot / 64] & (1ull << (slot % 64)));
+         page->bitmap[slot / 64] &= ~(1ull << (slot % 64));
+         page->free_count++;
+         return;
+      }
+   }
+   assert(!"sync slot freed into an unknown page");
+}
+
+static uint64_t
+sync_chan_completed(const void *chan)
+{
+   return nvkmd_nvrm_channel_completed(chan);
+}
+
+static uint64_t
+sync_chan_retire_point(const void *chan)
+{
+   return nvkmd_nvrm_channel_retire_point(chan);
+}
+
+/* Put freed slots whose channels have all retired the relevant work back into
+ * the pool. Caller holds sync_mutex. */
+static void
+sync_pool_reclaim_locked(struct nvkmd_nvrm_dev *dev)
+{
+   struct nvrm_retire_entry **entries =
+      util_dynarray_begin(&dev->sync_retiring);
+   unsigned count = util_dynarray_num_elements(&dev->sync_retiring,
+                                               struct nvrm_retire_entry *);
+   unsigned kept = 0;
+   for (unsigned i = 0; i < count; i++) {
+      struct nvrm_retire_entry *e = entries[i];
+      if (nvrm_retire_entry_ready(e, sync_chan_completed)) {
+         if (e->kind == SYNC_RETIRE_MEM_UNREF)
+            nvkmd_mem_unref(e->mem);
+         else
+            sync_pool_release_slot_locked(dev, e->mem, e->offset);
+         free(e);
+      } else {
+         entries[kept++] = e;
+      }
+   }
+   dev->sync_retiring.size = kept * sizeof(struct nvrm_retire_entry *);
+}
+
+bool
+nvkmd_nvrm_sync_register_channel(struct nvkmd_nvrm_dev *dev,
+                                 struct nvkmd_nvrm_channel *chan)
+{
+   simple_mtx_lock(&dev->sync_mutex);
+   struct nvkmd_nvrm_channel **slot =
+      util_dynarray_grow(&dev->sync_channels, struct nvkmd_nvrm_channel *, 1);
+   if (slot != NULL)
+      *slot = chan;
+   simple_mtx_unlock(&dev->sync_mutex);
+   return slot != NULL;
+}
+
+void
+nvkmd_nvrm_sync_unregister_channel(struct nvkmd_nvrm_dev *dev,
+                                   struct nvkmd_nvrm_channel *chan)
+{
+   simple_mtx_lock(&dev->sync_mutex);
+
+   bool found = false;
+   util_dynarray_foreach(&dev->sync_channels, struct nvkmd_nvrm_channel *, it) {
+      if (*it == chan) {
+         util_dynarray_delete_unordered(&dev->sync_channels,
+                                        struct nvkmd_nvrm_channel *, chan);
+         found = true;
+         break;
+      }
+   }
+
+   /* The channel is being destroyed, so its work can no longer touch any
+    * slot: stop waiting on it. */
+   if (found) {
+      util_dynarray_foreach(&dev->sync_retiring, struct nvrm_retire_entry *, it)
+         nvrm_retire_entry_forget_chan(*it, chan);
+      sync_pool_reclaim_locked(dev);
+   }
+
+   simple_mtx_unlock(&dev->sync_mutex);
+}
+
 static VkResult
 sync_pool_alloc_slot(struct nvkmd_nvrm_dev *dev,
                      struct nvkmd_mem **mem_out, uint64_t *offset_out)
 {
    VkResult result = VK_SUCCESS;
    simple_mtx_lock(&dev->sync_mutex);
+
+   if (util_dynarray_num_elements(&dev->sync_retiring,
+                                  struct nvrm_retire_entry *) > 0)
+      sync_pool_reclaim_locked(dev);
 
    uint32_t per_page = sync_pool_slots_per_page();
 
@@ -189,28 +296,72 @@ out:
    return result;
 }
 
+/* Release a pool slot or a dedicated sync's memory. If any channel may still
+ * execute a SEM method naming it, it is parked until that work has retired
+ * (see nvkmd_nvrm_retire.h): reusing a slot now would zero a word a queued
+ * GPU acquire or release still targets, and dropping the last reference to
+ * dedicated memory would unmap it from under one. */
+static void
+sync_retire(struct nvkmd_nvrm_dev *dev, struct nvkmd_mem *mem,
+            uint64_t offset, uint32_t kind)
+{
+   simple_mtx_lock(&dev->sync_mutex);
+
+   bool ready_now;
+   struct nvrm_retire_entry *e =
+      nvrm_retire_entry_create(mem, offset, kind,
+                               util_dynarray_begin(&dev->sync_channels),
+                               util_dynarray_num_elements(&dev->sync_channels,
+                                                          struct nvkmd_nvrm_channel *),
+                               sync_chan_completed, sync_chan_retire_point,
+                               &ready_now);
+   if (ready_now) {
+      if (kind == SYNC_RETIRE_MEM_UNREF)
+         nvkmd_mem_unref(mem);
+      else
+         sync_pool_release_slot_locked(dev, mem, offset);
+   } else if (e != NULL) {
+      struct nvrm_retire_entry **slot =
+         util_dynarray_grow(&dev->sync_retiring, struct nvrm_retire_entry *, 1);
+      if (slot != NULL) {
+         *slot = e;
+         if (!dev->sync_retire_reported) {
+            dev->sync_retire_reported = true;
+            fprintf(stderr, "nvk/nvrm: deferring reuse of a sync slot until "
+                    "queued GPU work retires (normal with a submit thread; "
+                    "reported once per device)\n");
+         }
+      } else {
+         free(e);  /* out of memory: never reuse it (leak) */
+      }
+   }
+   /* else: out of memory recording it: never reuse it (leak). */
+
+   simple_mtx_unlock(&dev->sync_mutex);
+}
+
 static void
 sync_pool_free_slot(struct nvkmd_nvrm_dev *dev,
                     struct nvkmd_mem *mem, uint64_t offset)
 {
-   uint32_t slot = (uint32_t)(offset / NVRM_SYNC_SLOT_SIZE);
-
-   simple_mtx_lock(&dev->sync_mutex);
-   util_dynarray_foreach(&dev->sync_pages, struct nvkmd_nvrm_sync_page *, it) {
-      struct nvkmd_nvrm_sync_page *page = *it;
-      if (page->mem == mem) {
-         assert(page->bitmap[slot / 64] & (1ull << (slot % 64)));
-         page->bitmap[slot / 64] &= ~(1ull << (slot % 64));
-         page->free_count++;
-         break;
-      }
-   }
-   simple_mtx_unlock(&dev->sync_mutex);
+   sync_retire(dev, mem, offset, SYNC_RETIRE_POOL_SLOT);
 }
 
 void
 nvkmd_nvrm_sync_pool_finish(struct nvkmd_nvrm_dev *dev)
 {
+   /* Every channel is gone by now, so nothing the entries wait for can still
+    * happen: release them. Pool pages are freed below. */
+   assert(util_dynarray_num_elements(&dev->sync_channels,
+                                     struct nvkmd_nvrm_channel *) == 0);
+   util_dynarray_foreach(&dev->sync_retiring, struct nvrm_retire_entry *, it) {
+      if ((*it)->kind == SYNC_RETIRE_MEM_UNREF)
+         nvkmd_mem_unref((*it)->mem);
+      free(*it);
+   }
+   util_dynarray_fini(&dev->sync_retiring);
+   util_dynarray_fini(&dev->sync_channels);
+
    util_dynarray_foreach(&dev->sync_events, struct nvkmd_nvrm_sync_event, ev)
       sync_event_destroy(dev, ev->fd, ev->hEvent);
    util_dynarray_fini(&dev->sync_events);
@@ -230,8 +381,11 @@ sync_release_backing(struct nvkmd_nvrm_sync *sync)
 {
    if (sync->mem == NULL)
       return;
+   /* Both deferred until queued GPU work naming the word has retired. For
+    * dedicated memory that matters when ours is the last reference, e.g. a
+    * temporarily imported payload the runtime destroys right after submit. */
    if (sync->dedicated)
-      nvkmd_mem_unref(sync->mem);
+      sync_retire(sync->dev, sync->mem, 0, SYNC_RETIRE_MEM_UNREF);
    else
       sync_pool_free_slot(sync->dev, sync->mem, sync->offset);
    sync->mem = NULL;
@@ -339,15 +493,25 @@ sync_cpu_signal_data(struct nvkmd_nvrm_sync *sync, uint64_t value)
  * `value` would race a GPU acquire emitted by an earlier submit that re-reads
  * the slot at execution time (the runtime resets a binary wait-semaphore right
  * after vkQueueSubmit in IMMEDIATE mode), stalling the host on that acquire
- * forever. Instead raise the baseline to the current payload, so "signaled"
- * (value > reset_mark) requires a fresh signal while the monotonic value stays
- * put for any in-flight acquire. */
+ * forever. Instead raise the baseline, so "signaled" (value > reset_mark)
+ * requires a fresh signal while the monotonic value stays put for any
+ * in-flight acquire.
+ *
+ * The baseline must cover signals already *submitted*, not only completed
+ * ones. The runtime resets right after submitting the wait, typically before
+ * the GPU has run the signal it consumes (value = k-1, submit_seq = k). A
+ * baseline of k-1 would make the sync read signaled again once that release
+ * lands, and pending again at once; a later move of a binary wait then passes
+ * its WAIT_PENDING on that stale state, swaps backings before the real next
+ * signal has been emitted, and the moved acquire waits on the old slot for a
+ * value that now goes to the new one. */
 static void
 sync_reset_data(struct nvkmd_nvrm_sync *sync)
 {
    struct nvrm_sync_data *d = sync_data(sync);
    uint64_t v = __atomic_load_n(&d->value, __ATOMIC_ACQUIRE);
-   __atomic_store_n(&d->reset_mark, v, __ATOMIC_SEQ_CST);
+   uint64_t submitted = __atomic_load_n(&d->submit_seq, __ATOMIC_ACQUIRE);
+   __atomic_store_n(&d->reset_mark, MAX2(v, submitted), __ATOMIC_SEQ_CST);
 }
 
 static VkResult
