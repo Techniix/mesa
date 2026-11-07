@@ -166,7 +166,29 @@ VkResult nvkmd_nvrm_alloc_va(struct nvkmd_dev *dev,
  * non-blocking slot recycling, the RC-error notifier and an OS wake event.
  * Built by nvrm_channel_init(); both contexts emit host SEM acquire/release +
  * non-stall interrupt methods into it and submit via the same helpers. */
+/* Diagnostics only: the most recent host semaphore methods emitted on a
+ * channel, so a CPU wait that stalls can say what the GPU is parked on (see
+ * nvkmd_nvrm_channel_report). Written and read under dev->sync_mutex. */
+#define NVRM_CHAN_SEM_LOG 16
+
+struct nvkmd_nvrm_sem_record {
+   /* CPU view of the 64-bit payload, or NULL if there is none. Only read
+    * while fence > the channel's completed fence: until then the backing
+    * memory stays allocated (pool pages live until device teardown, and
+    * freed sync memory is retired only past the channel's work). */
+   const volatile uint64_t *word;
+   uint64_t addr;   /* GPU VA of the payload */
+   uint64_t value;  /* acquire: waits for payload >= value; release: writes it */
+   uint64_t fence;  /* channel fence (wSeq) of the submit cycle carrying it */
+};
+
 struct nvkmd_nvrm_channel {
+   struct nvkmd_nvrm_dev *dev;
+   const char *kind;  /* "exec", "copy" or "bind", for diagnostics */
+   struct nvkmd_nvrm_sem_record acqLog[NVRM_CHAN_SEM_LOG];
+   struct nvkmd_nvrm_sem_record relLog[NVRM_CHAN_SEM_LOG];
+   uint32_t acqLogNext;
+   uint32_t relLogNext;
    struct nvkmd_mem *notifier;
    struct nvkmd_mem *userD;
    struct nvkmd_mem *gpFifo;
@@ -216,6 +238,7 @@ struct NvRmSemSurf;
 /* One queued semaphore acquire (wait) or release (signal) on the bind channel,
  * captured at wait()/signal() time and emitted in flush(). */
 struct nvkmd_nvrm_bind_sem {
+   const volatile uint64_t *word;  /* CPU view, for diagnostics */
    uint64_t addr;
    uint64_t value;
 };
@@ -302,6 +325,9 @@ void nvkmd_nvrm_sync_unregister_channel(struct nvkmd_nvrm_dev *dev,
 /* The channel fence it has completed, and the fence by which it will have
  * executed everything emitted so far (submitted or still in its push). */
 uint64_t nvkmd_nvrm_channel_completed(const struct nvkmd_nvrm_channel *chan);
+uint32_t nvkmd_nvrm_channel_rc_status(const struct nvkmd_nvrm_channel *chan);
+void nvkmd_nvrm_channel_report(const struct nvkmd_nvrm_channel *chan);
+const volatile uint64_t *nvkmd_nvrm_sync_cpu_word(struct vk_sync *sync);
 uint64_t nvkmd_nvrm_channel_retire_point(const struct nvkmd_nvrm_channel *chan);
 uint64_t nvkmd_nvrm_sync_gpu_signal_value(struct vk_sync *sync, uint64_t value);
 uint64_t nvkmd_nvrm_sync_gpu_wait_value(struct vk_sync *sync, uint64_t value);
