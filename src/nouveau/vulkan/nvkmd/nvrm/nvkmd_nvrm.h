@@ -184,6 +184,11 @@ struct nvkmd_nvrm_channel {
     * completed. */
    uint32_t cmdBufCurSlot;
    uint64_t cmdBufSlotFence[NVRM_CTX_CMDBUF_SLOTS];
+   /* GPPut right after each slot's submit cycle. Once that slot's fence has
+    * completed, the host has fetched every GP entry before this position, so
+    * it bounds GPFIFO reuse without trusting USERD GPGet (see
+    * chan_retired_gp_get). */
+   uint32_t cmdBufSlotGpPut[NVRM_CTX_CMDBUF_SLOTS];
 };
 
 struct nvkmd_nvrm_exec_ctx {

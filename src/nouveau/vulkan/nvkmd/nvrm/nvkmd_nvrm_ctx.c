@@ -119,18 +119,53 @@ chan_begin_slot(struct nvkmd_nvrm_channel *chan)
 	chan->cmdBufSubmittedDw = 0;
 }
 
+/* The GPFIFO position the host is known to have consumed: the GPPut recorded
+ * at the end of the newest submit cycle whose fence has completed (a completed
+ * fence means every GP entry before it was fetched and executed).
+ *
+ * USERD GPGet is not used for this. On an RTX 5070 under Haiku the render
+ * thread hung in the back-pressure loop below (waiting for GPGet to move)
+ * a few seconds into rendering, while the slot-recycle wait, which reads the
+ * channel fence, never stalled: GPGet as seen through the CPU mapping was not
+ * keeping up with the GPU. The channel fence is the signal the slot-recycle
+ * wait already relies on, so use it here too. */
+static uint32_t
+chan_retired_gp_get(struct nvkmd_nvrm_channel *chan)
+{
+	uint64_t done = chan_completed(chan);
+	uint64_t best = 0;
+	for (uint32_t i = 0; i < NVRM_CTX_CMDBUF_SLOTS; i++) {
+		uint64_t f = chan->cmdBufSlotFence[i];
+		if (f != 0 && f <= done && f > best) {
+			best = f;
+			chan->gpGet = chan->cmdBufSlotGpPut[i];
+		}
+	}
+	/* chan->gpGet keeps the last known position when every recorded slot is
+	 * still pending (retirement only moves forward). */
+	return (uint32_t)(chan->gpGet % NVRM_CTX_GPFIFO_ENTRIES);
+}
+
 static void
 chan_write_gp_fifo_entry(struct nvkmd_nvrm_channel *chan, const struct nvkmd_ctx_exec *exec)
 {
 	uint32_t next = (uint32_t)((chan->gpPut + 1) % NVRM_CTX_GPFIFO_ENTRIES);
 
-	/* Back-pressure: never let GPPut catch the host's GPGet. Earlier
-	 * submissions have been doorbelled, so the host keeps draining and GPGet
-	 * advances; bail out on a dead channel rather than spin forever. */
-	KeplerBControlGPFifo *userD = chan->userD->map;
-	while (next == (userD->GPGet % NVRM_CTX_GPFIFO_ENTRIES)) {
+	/* Back-pressure: never let GPPut catch the host's read position. Earlier
+	 * submissions have been doorbelled, so the host keeps draining and the
+	 * channel fence advances; bail out on a dead channel rather than spin
+	 * forever. In practice the 32-slot cmdBuf ring throttles submission long
+	 * before the 0x8000-entry GPFIFO fills, so this rarely waits at all. */
+	const uint64_t wait_start = os_time_get_nano();
+	uint64_t next_report = wait_start + 3000000000ull;
+	while (next == chan_retired_gp_get(chan)) {
 		if (chan_check_error(chan))
 			break;
+		uint64_t now = os_time_get_nano();
+		if (now >= next_report) {
+			chan_report_stuck(chan, "GPFIFO full", chan->wSeq, now - wait_start);
+			next_report = now + 5000000000ull;
+		}
 		struct pollfd pfd = { .fd = chan->osEvent, .events = POLLIN | POLLPRI };
 		poll(&pfd, 1, 100);
 	}
@@ -363,6 +398,7 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
    *doorbell = submitTokenNotifier->info32;
 
    chan->cmdBufSlotFence[chan->cmdBufCurSlot] = chan->wSeq;
+   chan->cmdBufSlotGpPut[chan->cmdBufCurSlot] = (uint32_t)chan->gpPut;
    chan->cmdBufCurSlot = (chan->cmdBufCurSlot + 1) % NVRM_CTX_CMDBUF_SLOTS;
 
    VkResult result = VK_SUCCESS;
