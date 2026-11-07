@@ -95,6 +95,95 @@ chan_check_error(struct nvkmd_nvrm_channel *chan)
 	return notifiers[NV906F_NOTIFIERS_RC].status != 0;
 }
 
+/* RM's robust-channel error status for the channel: 0 while it is healthy.
+ * A channel with an RC error has stopped executing for good. */
+uint32_t
+nvkmd_nvrm_channel_rc_status(const struct nvkmd_nvrm_channel *chan)
+{
+	const volatile NvNotification *notifiers = chan->notifier->map;
+	return notifiers[NV906F_NOTIFIERS_RC].status;
+}
+
+/* Record a host semaphore method for nvkmd_nvrm_channel_report(). Methods
+ * written now belong to the current submit cycle, which nvrm_channel_submit
+ * retires with fence wSeq + 1. */
+static void
+chan_log_sem(struct nvkmd_nvrm_channel *chan, bool acquire,
+             const volatile uint64_t *word, uint64_t addr, uint64_t value)
+{
+	struct nvkmd_nvrm_sem_record rec = {
+		.word = word,
+		.addr = addr,
+		.value = value,
+		.fence = chan->wSeq + 1,
+	};
+	simple_mtx_lock(&chan->dev->sync_mutex);
+	if (acquire)
+		chan->acqLog[chan->acqLogNext++ % NVRM_CHAN_SEM_LOG] = rec;
+	else
+		chan->relLog[chan->relLogNext++ % NVRM_CHAN_SEM_LOG] = rec;
+	simple_mtx_unlock(&chan->dev->sync_mutex);
+}
+
+static void
+chan_report_sem_log(const struct nvkmd_nvrm_channel *chan, bool acquire,
+                    uint64_t completed)
+{
+	const struct nvkmd_nvrm_sem_record *recs =
+		acquire ? chan->acqLog : chan->relLog;
+	uint32_t next = acquire ? chan->acqLogNext : chan->relLogNext;
+	/* Every acquire still pending (the oldest is the one the host is parked
+	 * on), but only the latest releases. */
+	uint32_t count = MIN2(next, acquire ? NVRM_CHAN_SEM_LOG : 6);
+
+	for (uint32_t n = count; n > 0; n--) {
+		const struct nvkmd_nvrm_sem_record *r =
+			&recs[(next - n) % NVRM_CHAN_SEM_LOG];
+		bool done = r->fence <= completed;
+		if (acquire && done)
+			continue;  /* only acquires the GPU may still be parked on */
+
+		if (!done && r->word != NULL) {
+			uint64_t now = *r->word;
+			fprintf(stderr, "nvk/nvrm:     %s 0x%" PRIx64 " %s %" PRIu64
+			        " (now %" PRIu64 "%s), fence %" PRIu64 ", pending\n",
+			        acquire ? "acquire" : "release", r->addr,
+			        acquire ? ">=" : "=", r->value, now,
+			        acquire ? (now >= r->value ? ", satisfied"
+			                                   : ", NOT satisfied") : "",
+			        r->fence);
+		} else {
+			fprintf(stderr, "nvk/nvrm:     %s 0x%" PRIx64 " %s %" PRIu64
+			        ", fence %" PRIu64 ", %s\n",
+			        acquire ? "acquire" : "release", r->addr,
+			        acquire ? ">=" : "=", r->value, r->fence,
+			        done ? "done" : "pending");
+		}
+	}
+}
+
+/* Print the channel's state and its recent semaphore methods, for a CPU wait
+ * that has stalled (nvkmd_nvrm_sync.c). Caller holds dev->sync_mutex. */
+void
+nvkmd_nvrm_channel_report(const struct nvkmd_nvrm_channel *chan)
+{
+	const KeplerBControlGPFifo *userD = chan->userD->map;
+	uint64_t completed = nvkmd_nvrm_channel_completed(chan);
+	uint32_t rc = nvkmd_nvrm_channel_rc_status(chan);
+
+	fprintf(stderr, "nvk/nvrm:   %s channel %p: completed fence %" PRIu64
+	        " of %" PRIu64 " submitted, GPGet %u GPPut %u%s",
+	        chan->kind ? chan->kind : "?", (const void *)chan, completed,
+	        chan->wSeq, (unsigned)userD->GPGet, (unsigned)userD->GPPut,
+	        completed >= chan->wSeq ? ", idle" : "");
+	if (rc != 0)
+		fprintf(stderr, ", RC ERROR status 0x%x (channel stopped)", rc);
+	fprintf(stderr, "\n");
+
+	chan_report_sem_log(chan, true, completed);
+	chan_report_sem_log(chan, false, completed);
+}
+
 static uint32_t
 chan_slot_dwords(void)
 {
@@ -300,6 +389,7 @@ nvrm_channel_init(struct nvkmd_nvrm_dev *dev,
    struct NvRmApi rm;
    nvkmd_nvrm_dev_api_ctl(pdev, &rm);
 
+   chan->dev = dev;
    chan->osEvent = -1;
 
    VK_CHECK(nvkmd_dev_alloc_mapped_mem(_dev, log_obj,  0x1000,  0x1000, NVKMD_MEM_GART, NVKMD_MEM_MAP_RDWR,  &chan->notifier));
@@ -502,6 +592,7 @@ nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
 
    ctx->base.ops = &nvkmd_nvrm_exec_ctx_ops;
    ctx->base.dev = &dev->base;
+   ctx->chan.kind = engines == NVKMD_ENGINE_COPY ? "copy" : "exec";
 
    VK_CHECK(nvrm_channel_init(dev, log_obj, &ctx->chan));
 
@@ -560,6 +651,8 @@ nvkmd_nvrm_exec_ctx_wait(struct nvkmd_ctx *_ctx,
       uint64_t addr = nvkmd_nvrm_sync_gpu_addr(waits[i].sync);
       uint64_t value = nvkmd_nvrm_sync_gpu_wait_value(waits[i].sync, waits[i].wait_value);
       write_semaphore_acquire(&ctx->chan.push, addr, value);
+      chan_log_sem(&ctx->chan, true, nvkmd_nvrm_sync_cpu_word(waits[i].sync),
+                   addr, value);
    }
    chan_emit_push_segment(&ctx->chan);
 
@@ -606,6 +699,8 @@ nvkmd_nvrm_exec_ctx_signal(struct nvkmd_ctx *_ctx,
       uint64_t addr = nvkmd_nvrm_sync_gpu_addr(signals[i].sync);
       uint64_t value = nvkmd_nvrm_sync_gpu_signal_value(signals[i].sync, signals[i].signal_value);
       write_semaphore_release(&ctx->chan.push, addr, value, true);
+      chan_log_sem(&ctx->chan, false, nvkmd_nvrm_sync_cpu_word(signals[i].sync),
+                   addr, value);
    }
 
    return nvkmd_nvrm_exec_ctx_flush(&ctx->base, log_obj);
@@ -672,6 +767,7 @@ nvkmd_nvrm_create_bind_ctx(struct nvkmd_dev *_dev,
 
    ctx->base.ops = &nvkmd_nvrm_bind_ctx_ops;
    ctx->base.dev = &dev->base;
+   ctx->chan.kind = "bind";
    ctx->mapperQueueSize = NVRM_BIND_MAPPER_QUEUE_SIZE;
    util_dynarray_init(&ctx->waits, NULL);
    util_dynarray_init(&ctx->signals, NULL);
@@ -758,6 +854,7 @@ nvkmd_nvrm_bind_ctx_wait(struct nvkmd_ctx *_ctx,
 
    for (uint32_t i = 0; i < wait_count; i++) {
       struct nvkmd_nvrm_bind_sem s = {
+         .word = nvkmd_nvrm_sync_cpu_word(waits[i].sync),
          .addr = nvkmd_nvrm_sync_gpu_addr(waits[i].sync),
          .value = nvkmd_nvrm_sync_gpu_wait_value(waits[i].sync, waits[i].wait_value),
       };
@@ -970,8 +1067,10 @@ nvkmd_nvrm_bind_ctx_flush(struct nvkmd_ctx *_ctx,
    uint32_t n_ops = util_dynarray_num_elements(&ctx->ops, struct nvkmd_nvrm_bind_op);
 
    /* 1. Acquire the wait semaphores (the host stalls until the app signals). */
-   util_dynarray_foreach(&ctx->waits, struct nvkmd_nvrm_bind_sem, w)
+   util_dynarray_foreach(&ctx->waits, struct nvkmd_nvrm_bind_sem, w) {
       write_semaphore_acquire(&ctx->chan.push, w->addr, w->value);
+      chan_log_sem(&ctx->chan, true, w->word, w->addr, w->value);
+   }
    chan_emit_push_segment(&ctx->chan);
 
    /* 2. Rendezvous the paging ops with the mapper, one mapper-queue-sized chunk
@@ -998,6 +1097,7 @@ nvkmd_nvrm_bind_ctx_flush(struct nvkmd_ctx *_ctx,
             goto done;
 
          write_semaphore_acquire(&ctx->chan.push, doneAddr, seq);
+         chan_log_sem(&ctx->chan, true, NULL, doneAddr, seq);
          chan_emit_push_segment(&ctx->chan);
 
          /* The mapper queue can't hold the next chunk's ops until this one has
@@ -1017,8 +1117,10 @@ nvkmd_nvrm_bind_ctx_flush(struct nvkmd_ctx *_ctx,
    }
 
    /* 3. Release the signal semaphores (after DONE), waking their CPU waiters. */
-   util_dynarray_foreach(&ctx->signals, struct nvkmd_nvrm_bind_sem, s)
+   util_dynarray_foreach(&ctx->signals, struct nvkmd_nvrm_bind_sem, s) {
       write_semaphore_release(&ctx->chan.push, s->addr, s->value, false);
+      chan_log_sem(&ctx->chan, false, s->word, s->addr, s->value);
+   }
 
    result = nvrm_channel_submit(dev, &ctx->chan, log_obj);
 
@@ -1040,6 +1142,7 @@ nvkmd_nvrm_bind_ctx_signal(struct nvkmd_ctx *_ctx,
 
    for (uint32_t i = 0; i < signal_count; i++) {
       struct nvkmd_nvrm_bind_sem s = {
+         .word = nvkmd_nvrm_sync_cpu_word(signals[i].sync),
          .addr = nvkmd_nvrm_sync_gpu_addr(signals[i].sync),
          .value = nvkmd_nvrm_sync_gpu_signal_value(signals[i].sync, signals[i].signal_value),
       };

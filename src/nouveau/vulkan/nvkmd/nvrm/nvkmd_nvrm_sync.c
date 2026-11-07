@@ -726,8 +726,10 @@ sync_event_release(struct nvkmd_nvrm_dev *dev, int fd, NvHandle hEvent)
 #define STUCK_EVERY_NS (5ull * 1000000000ull)
 
 static void
-sync_wait_report_stuck(const struct vk_sync_wait *waits, uint32_t wait_count,
-                       enum vk_sync_wait_flags wait_flags, uint64_t waited_ns)
+sync_wait_report_stuck(struct nvkmd_nvrm_dev *dev,
+                       const struct vk_sync_wait *waits, uint32_t wait_count,
+                       enum vk_sync_wait_flags wait_flags, uint64_t waited_ns,
+                       bool with_channels)
 {
    fprintf(stderr, "nvk/nvrm: CPU wait not satisfied after %.1f s "
            "(%u sync%s, %s%s)\n",
@@ -737,10 +739,10 @@ sync_wait_report_stuck(const struct vk_sync_wait *waits, uint32_t wait_count,
    for (uint32_t i = 0; i < wait_count; i++) {
       struct nvkmd_nvrm_sync *sync = to_nvkmd_nvrm_sync(waits[i].sync);
       struct nvrm_sync_data *d = sync_data(sync);
-      fprintf(stderr, "nvk/nvrm:   [%u] %p %s wait_value %" PRIu64
+      fprintf(stderr, "nvk/nvrm:   [%u] %p (gpu 0x%" PRIx64 ") %s wait_value %" PRIu64
               ": value %" PRIu64 " submit_seq %" PRIu64
               " wait_seq %" PRIu64 " reset_mark %" PRIu64 "\n",
-              i, (void *)sync,
+              i, (void *)sync, nvkmd_nvrm_sync_gpu_addr(waits[i].sync),
               sync_is_timeline(waits[i].sync) ? "timeline" : "binary",
               waits[i].wait_value,
               __atomic_load_n(&d->value, __ATOMIC_ACQUIRE),
@@ -748,6 +750,40 @@ sync_wait_report_stuck(const struct vk_sync_wait *waits, uint32_t wait_count,
               __atomic_load_n(&d->wait_seq, __ATOMIC_ACQUIRE),
               __atomic_load_n(&d->reset_mark, __ATOMIC_ACQUIRE));
    }
+
+   /* What the GPU is doing: whether each channel is idle, still working, or
+    * stopped by an error, and the semaphore acquires it may be parked on. A
+    * release of the waited-for value that shows as done, with the value still
+    * short of it, means a later release wrote a lower value over it. */
+   if (!with_channels)
+      return;
+   simple_mtx_lock(&dev->sync_mutex);
+   util_dynarray_foreach(&dev->sync_channels, struct nvkmd_nvrm_channel *, it)
+      nvkmd_nvrm_channel_report(*it);
+   simple_mtx_unlock(&dev->sync_mutex);
+}
+
+/* A channel RM has stopped with a robust-channel error never completes its
+ * work again, so a CPU wait on anything it would signal can only hang. Report
+ * it once and let the wait fail with VK_ERROR_DEVICE_LOST instead. */
+static bool
+sync_channel_lost(struct nvkmd_nvrm_dev *dev)
+{
+   bool lost = false;
+   simple_mtx_lock(&dev->sync_mutex);
+   util_dynarray_foreach(&dev->sync_channels, struct nvkmd_nvrm_channel *, it) {
+      uint32_t rc = nvkmd_nvrm_channel_rc_status(*it);
+      if (rc != 0) {
+         fprintf(stderr, "nvk/nvrm: %s channel %p stopped with RC error "
+                 "status 0x%x; the device is lost\n",
+                 (*it)->kind ? (*it)->kind : "?", (void *)*it, rc);
+         nvkmd_nvrm_channel_report(*it);
+         lost = true;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->sync_mutex);
+   return lost;
 }
 
 static VkResult
@@ -773,9 +809,15 @@ sync_wait_impl(struct nvkmd_nvrm_dev *dev,
    VkResult result;
    const uint64_t wait_start = os_time_get_nano();
    uint64_t next_report = wait_start + STUCK_FIRST_NS;
+   uint32_t reports = 0;
    for (;;) {
       if (sync_wait_satisfied(waits, wait_count, wait_flags)) {
          result = VK_SUCCESS;
+         break;
+      }
+
+      if (sync_channel_lost(dev)) {
+         result = VK_ERROR_DEVICE_LOST;
          break;
       }
 
@@ -785,8 +827,10 @@ sync_wait_impl(struct nvkmd_nvrm_dev *dev,
          break;
       }
       if ((uint64_t)now >= next_report) {
-         sync_wait_report_stuck(waits, wait_count, wait_flags,
-                                (uint64_t)now - wait_start);
+         /* Channel state on the first report, then every sixth (30 s). */
+         sync_wait_report_stuck(dev, waits, wait_count, wait_flags,
+                                (uint64_t)now - wait_start,
+                                reports++ % 6 == 0);
          next_report = (uint64_t)now + STUCK_EVERY_NS;
       }
 
@@ -936,6 +980,15 @@ nvkmd_nvrm_sync_cpu_signal(struct vk_sync *_sync, uint64_t value)
 
    sync_cpu_signal_data(sync, value);
    sync_trigger_fifo(sync->dev);
+}
+
+/* CPU view of the 64-bit payload a GPU acquire/release on this sync reads or
+ * writes (diagnostics, see nvkmd_nvrm_channel_report). */
+const volatile uint64_t *
+nvkmd_nvrm_sync_cpu_word(struct vk_sync *_sync)
+{
+   struct nvkmd_nvrm_sync *sync = to_nvkmd_nvrm_sync(_sync);
+   return &sync_data(sync)->value;
 }
 
 uint64_t
