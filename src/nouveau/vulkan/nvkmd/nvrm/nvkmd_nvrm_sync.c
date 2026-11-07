@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <poll.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <inttypes.h>
 
 #include "vk_log.h"
 #include "nvk_device.h"
@@ -552,6 +554,38 @@ sync_event_release(struct nvkmd_nvrm_dev *dev, int fd, NvHandle hEvent)
    simple_mtx_unlock(&dev->sync_mutex);
 }
 
+/* A CPU wait that runs for seconds is almost always a lost signal. Say which
+ * sync it is and where its counters stand, so a hang can be diagnosed from the
+ * app's stderr instead of a debugger. Printed after STUCK_FIRST_NS and then
+ * every STUCK_EVERY_NS; the wait itself carries on unchanged. */
+#define STUCK_FIRST_NS (3ull * 1000000000ull)
+#define STUCK_EVERY_NS (5ull * 1000000000ull)
+
+static void
+sync_wait_report_stuck(const struct vk_sync_wait *waits, uint32_t wait_count,
+                       enum vk_sync_wait_flags wait_flags, uint64_t waited_ns)
+{
+   fprintf(stderr, "nvk/nvrm: CPU wait not satisfied after %.1f s "
+           "(%u sync%s, %s%s)\n",
+           waited_ns / 1e9, wait_count, wait_count == 1 ? "" : "s",
+           (wait_flags & VK_SYNC_WAIT_ANY) ? "any" : "all",
+           (wait_flags & VK_SYNC_WAIT_PENDING) ? ", pending" : "");
+   for (uint32_t i = 0; i < wait_count; i++) {
+      struct nvkmd_nvrm_sync *sync = to_nvkmd_nvrm_sync(waits[i].sync);
+      struct nvrm_sync_data *d = sync_data(sync);
+      fprintf(stderr, "nvk/nvrm:   [%u] %p %s wait_value %" PRIu64
+              ": value %" PRIu64 " submit_seq %" PRIu64
+              " wait_seq %" PRIu64 " reset_mark %" PRIu64 "\n",
+              i, (void *)sync,
+              sync_is_timeline(waits[i].sync) ? "timeline" : "binary",
+              waits[i].wait_value,
+              __atomic_load_n(&d->value, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&d->submit_seq, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&d->wait_seq, __ATOMIC_ACQUIRE),
+              __atomic_load_n(&d->reset_mark, __ATOMIC_ACQUIRE));
+   }
+}
+
 static VkResult
 sync_wait_impl(struct nvkmd_nvrm_dev *dev,
                uint32_t wait_count,
@@ -573,6 +607,8 @@ sync_wait_impl(struct nvkmd_nvrm_dev *dev,
    int evFd = can_event ? sync_event_acquire(dev, &hEvent) : -1;
 
    VkResult result;
+   const uint64_t wait_start = os_time_get_nano();
+   uint64_t next_report = wait_start + STUCK_FIRST_NS;
    for (;;) {
       if (sync_wait_satisfied(waits, wait_count, wait_flags)) {
          result = VK_SUCCESS;
@@ -583,6 +619,11 @@ sync_wait_impl(struct nvkmd_nvrm_dev *dev,
       if ((uint64_t)now >= abs_timeout_ns) {
          result = VK_TIMEOUT;
          break;
+      }
+      if ((uint64_t)now >= next_report) {
+         sync_wait_report_stuck(waits, wait_count, wait_flags,
+                                (uint64_t)now - wait_start);
+         next_report = (uint64_t)now + STUCK_EVERY_NS;
       }
 
       /* Unsigned, so a near-UINT64_MAX (effectively infinite) timeout doesn't
