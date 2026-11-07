@@ -304,8 +304,10 @@ clock_id_to_vk_time_domain(clockid_t id)
    switch (id) {
       case CLOCK_MONOTONIC:
          return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#ifdef CLOCK_MONOTONIC_RAW
       case CLOCK_MONOTONIC_RAW:
          return VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR;
+#endif
       default:
          /* Default fallback. Will likely not be used, but is safe to use. */
          return VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
@@ -319,7 +321,11 @@ vk_time_domain_to_clock_id(VkTimeDomainKHR id)
       case VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR:
          return CLOCK_MONOTONIC;
       case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR:
+#ifdef CLOCK_MONOTONIC_RAW
          return CLOCK_MONOTONIC_RAW;
+#else
+         return CLOCK_MONOTONIC;
+#endif
       default:
          /* Default fallback. Will not be used. */
          return 0;
@@ -2145,8 +2151,13 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
          /* We could deal with esoteric clock domains by exposing VK_TIME_DOMAIN_SWAPCHAIN or PRESENT_STAGE_LOCAL,
           * but that requires a lot more scaffolding, and there's no need to add extra complexity if we can
           * get away with this. */
+#ifdef CLOCK_MONOTONIC_RAW
          if (clock_id != CLOCK_MONOTONIC && clock_id != CLOCK_MONOTONIC_RAW)
             break;
+#else
+         if (clock_id != CLOCK_MONOTONIC)
+            break;
+#endif
 
          /* Presentation timing spec talks about the reported time targeting "pixel being visible".
           * From presentation-time spec: "Note, that if the display path has a non-zero latency,
