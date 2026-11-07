@@ -21,6 +21,7 @@
 #include "util/u_memory.h"
 #include "util/u_dynarray.h"
 #include "util/macros.h"
+#include "util/os_time.h"
 #include "nv_push_clc36f.h"
 
 #include "class/cl0002.h" // NV01_CONTEXT_DMA
@@ -68,6 +69,22 @@ static uint64_t
 chan_completed(struct nvkmd_nvrm_channel *chan)
 {
 	return *(volatile uint64_t *)chan->sem->map;
+}
+
+/* Report a channel wait that has run for seconds: the fence it needs, what
+ * the GPU has completed, and where the GPFIFO stands. GPGet stuck short of
+ * GPPut with no RC error usually means the GPU is parked on a semaphore
+ * acquire whose signal never came. */
+static void
+chan_report_stuck(struct nvkmd_nvrm_channel *chan, const char *what,
+                  uint64_t target, uint64_t waited_ns)
+{
+	KeplerBControlGPFifo *userD = chan->userD->map;
+	fprintf(stderr, "nvk/nvrm: %s waiting %.1f s for fence %" PRIu64
+	        ": completed %" PRIu64 ", submitted %" PRIu64
+	        ", GPGet %u GPPut %u\n",
+	        what, waited_ns / 1e9, target, chan_completed(chan), chan->wSeq,
+	        (unsigned)userD->GPGet, (unsigned)userD->GPPut);
 }
 
 /* True once RM has reported a robust-channel error on this channel. */
@@ -349,10 +366,17 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
    chan->cmdBufCurSlot = (chan->cmdBufCurSlot + 1) % NVRM_CTX_CMDBUF_SLOTS;
 
    VkResult result = VK_SUCCESS;
+   const uint64_t wait_start = os_time_get_nano();
+   uint64_t next_report = wait_start + 3000000000ull;
    while (chan_completed(chan) < chan->cmdBufSlotFence[chan->cmdBufCurSlot]) {
       if (chan_check_error(chan)) {
          result = vk_error(log_obj, VK_ERROR_DEVICE_LOST);
          break;
+      }
+      uint64_t now = os_time_get_nano();
+      if (now >= next_report) {
+         chan_report_stuck(chan, "cmdbuf slot recycle", chan->cmdBufSlotFence[chan->cmdBufCurSlot], now - wait_start);
+         next_report = now + 5000000000ull;
       }
       struct pollfd pfd = { .fd = chan->osEvent, .events = POLLIN | POLLPRI };
       poll(&pfd, 1, 1000);
@@ -367,9 +391,16 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
 static VkResult
 nvrm_channel_sync(struct nvkmd_nvrm_channel *chan, struct vk_object_base *log_obj)
 {
+   const uint64_t wait_start = os_time_get_nano();
+   uint64_t next_report = wait_start + 3000000000ull;
    while (chan_completed(chan) < chan->wSeq) {
       if (chan_check_error(chan))
          return vk_error(log_obj, VK_ERROR_DEVICE_LOST);
+      uint64_t now = os_time_get_nano();
+      if (now >= next_report) {
+         chan_report_stuck(chan, "channel sync", chan->wSeq, now - wait_start);
+         next_report = now + 5000000000ull;
+      }
       struct pollfd pfd = { .fd = chan->osEvent, .events = POLLIN | POLLPRI };
       poll(&pfd, 1, 1000);
    }
