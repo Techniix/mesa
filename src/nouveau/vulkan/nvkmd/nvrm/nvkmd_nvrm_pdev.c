@@ -538,7 +538,15 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
    	.has_dma_buf = true,
    	.has_get_vram_used = true,
    	.has_alloc_tiled = true,
+#ifdef __HAIKU__
+   	/* Host-pointer import (VK_EXT_external_memory_host) goes through
+   	 * ALLOC_OS_DESCRIPTOR, which needs os_lock_user_pages(). The Haiku
+   	 * kernel driver doesn't implement it yet (it panics), so don't offer
+   	 * the extension there. */
+   	.has_userptr = false,
+#else
    	.has_userptr = true,
+#endif
    };
 
    pdev->channelClass = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sChannelClasses), sChannelClasses);
