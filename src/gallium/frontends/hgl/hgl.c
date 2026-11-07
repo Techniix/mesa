@@ -73,6 +73,10 @@ hgl_st_framebuffer_flush_front(struct st_context *st,
 	if (!ptex)
 		return true;
 
+	// A pbuffer has no window to show the front buffer in.
+	if (buffer->winsysContext == NULL)
+		return true;
+
 	// TODO: pipe_context here??? Might be needed for hw renderers
 	buffer->screen->flush_frontbuffer(buffer->screen, NULL, ptex, 0, 0,
 		buffer->winsysContext, 0, NULL);
@@ -107,6 +111,11 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
 	CALLED();
 
 	buffer = hgl_st_framebuffer(drawable);
+
+	/* A pbuffer (no BitmapHook) gets plain textures: nothing is ever
+	 * displayed, and a display-target or Zink drawable resource needs a
+	 * window to back it. */
+	const bool has_window = buffer->winsysContext != NULL;
 
 	if (buffer->width != width || buffer->height != height) {
 		TRACE("validate_textures: size changed: %d, %d -> %d, %d\n",
@@ -143,10 +152,14 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
 					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT])
 						bind &= ~PIPE_BIND_DISPLAY_TARGET;
 #endif
+					if (!has_window)
+						bind &= ~PIPE_BIND_DISPLAY_TARGET;
 					break;
 				case ST_ATTACHMENT_DEPTH_STENCIL:
 					format = buffer->visual.depth_stencil_format;
 					bind = PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_DEPTH_STENCIL;
+					if (!has_window)
+						bind &= ~PIPE_BIND_DISPLAY_TARGET;
 					break;
 				default:
 					format = PIPE_FORMAT_NONE;
@@ -159,7 +172,7 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
 				templat.bind = bind;
 				TRACE("resource_create(%d, %d, %d)\n", i, format, bind);
 #ifdef GALLIUM_ZINK
-				if (i < ST_ATTACHMENT_DEPTH_STENCIL && buffer->screen->resource_create_drawable) {
+				if (has_window && i < ST_ATTACHMENT_DEPTH_STENCIL && buffer->screen->resource_create_drawable) {
 					struct kopper_loader_info loader_info;
 					void *data;
 

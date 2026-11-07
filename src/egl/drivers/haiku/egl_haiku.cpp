@@ -159,8 +159,10 @@ haiku_create_pbuffer_surface(_EGLDisplay *disp, _EGLConfig *conf,
       return NULL;
    }
 
-   wgl_surf->fb->newWidth = wgl_surf->base.Width;
-   wgl_surf->fb->newHeight = wgl_surf->base.Height;
+   // EGL_WIDTH/EGL_HEIGHT default to 0, which is a valid pbuffer, but the
+   // backing textures can't be empty: give them at least one pixel.
+   wgl_surf->fb->newWidth = std::max<EGLint>(wgl_surf->base.Width, 1);
+   wgl_surf->fb->newHeight = std::max<EGLint>(wgl_surf->base.Height, 1);
    p_atomic_inc(&wgl_surf->fb->base.stamp);
 
    return &wgl_surf->base;
@@ -190,6 +192,11 @@ haiku_destroy_surface(_EGLDisplay *disp, _EGLSurface *surf)
 static void
 update_size(struct hgl_buffer *buffer)
 {
+   // A pbuffer has no window (winsysContext is NULL); its size was fixed when
+   // it was created.
+   if (buffer->winsysContext == NULL)
+      return;
+
    uint32_t newWidth, newHeight;
    ((BitmapHook *)buffer->winsysContext)->GetSize(newWidth, newHeight);
    if (buffer->newWidth != newWidth || buffer->newHeight != newHeight) {
@@ -207,6 +214,11 @@ haiku_swap_buffers(_EGLDisplay *disp, _EGLSurface *surf)
    struct haiku_egl_context *hgl_ctx = haiku_egl_context(surf->CurrentContext);
    if (hgl_ctx == NULL)
       return EGL_FALSE;
+
+   // EGL 1.5, 3.10.3: "If surface is a pixel buffer or a pixmap,
+   // eglSwapBuffers has no effect, and no error is generated."
+   if (hgl_surf->fb->winsysContext == NULL)
+      return EGL_TRUE;
 
    struct st_context *st = hgl_ctx->ctx->st;
    struct pipe_screen *screen = hgl_dpy->disp->fscreen->screen;
