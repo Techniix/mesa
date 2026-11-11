@@ -325,13 +325,15 @@ sync_retire(struct nvkmd_nvrm_dev *dev, struct nvkmd_mem *mem,
          util_dynarray_grow(&dev->sync_retiring, struct nvrm_retire_entry *, 1);
       if (slot != NULL) {
          *slot = e;
-         /* Normal operation, so silent unless debugging: the line shows
-          * that a run took the deferred-reuse path. */
-         if (!dev->sync_retire_reported && getenv("NVK_NVRM_DEBUG") != NULL) {
+         /* Normal operation, so the line is printed only when debugging:
+          * it shows that a run took the deferred-reuse path. The flag is
+          * always set; tests read it. */
+         if (!dev->sync_retire_reported) {
             dev->sync_retire_reported = true;
-            fprintf(stderr, "nvk/nvrm: deferring reuse of a sync slot until "
-                    "queued GPU work retires (normal with a submit thread; "
-                    "reported once per device)\n");
+            if (getenv("NVK_NVRM_DEBUG") != NULL)
+               fprintf(stderr, "nvk/nvrm: deferring reuse of a sync slot until "
+                       "queued GPU work retires (normal with a submit "
+                       "thread; reported once per device)\n");
          }
       } else {
          free(e);  /* out of memory: never reuse it (leak) */
