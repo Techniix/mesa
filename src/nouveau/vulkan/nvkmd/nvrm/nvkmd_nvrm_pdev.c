@@ -482,7 +482,9 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
    const uint8_t rmSm = (smVersion >> 8) * 10 + (smVersion & 0xf);
    const uint8_t tableSm = nvkmd_nvrm_sm_for_chipset(chipset);
    const uint8_t sm = tableSm != 0 ? tableSm : rmSm;
-   if (tableSm != 0 && tableSm != rmSm) {
+   /* Expected on every Blackwell card, on every device creation: only worth
+    * a line when someone is debugging device setup. */
+   if (tableSm != 0 && tableSm != rmSm && getenv("NVK_NVRM_DEBUG") != NULL) {
       fprintf(stderr, "nvk/nvrm: RM reports SM version %#x for chipset %#x; "
               "using SM %u to match the nouveau path\n",
               smVersion, chipset, sm);
