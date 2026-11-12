@@ -767,6 +767,23 @@ sync_wait_report_stuck(struct nvkmd_nvrm_dev *dev,
    simple_mtx_unlock(&dev->sync_mutex);
 }
 
+/* Ring the doorbell of every channel with work the GPU hasn't completed.
+ * Ringing it again is harmless; if a submission's doorbell reached the host
+ * before its GPPut did, this is what gets the work running (see
+ * chan_io_barrier() in nvkmd_nvrm_ctx.c). Returns how many it rang. */
+static uint32_t
+sync_kick_channels(struct nvkmd_nvrm_dev *dev)
+{
+   uint32_t kicked = 0;
+   simple_mtx_lock(&dev->sync_mutex);
+   util_dynarray_foreach(&dev->sync_channels, struct nvkmd_nvrm_channel *, it) {
+      if (nvkmd_nvrm_channel_kick(*it))
+         kicked++;
+   }
+   simple_mtx_unlock(&dev->sync_mutex);
+   return kicked;
+}
+
 /* A channel RM has stopped with a robust-channel error never completes its
  * work again, so a CPU wait on anything it would signal can only hang. Report
  * it once and let the wait fail with VK_ERROR_DEVICE_LOST instead. */
@@ -814,8 +831,19 @@ sync_wait_impl(struct nvkmd_nvrm_dev *dev,
    const uint64_t wait_start = os_time_get_nano();
    uint64_t next_report = wait_start + STUCK_FIRST_NS;
    uint32_t reports = 0;
+   uint32_t kicked = 0;
    for (;;) {
       if (sync_wait_satisfied(waits, wait_count, wait_flags)) {
+         /* Report a recovery, so a run shows whether a lost doorbell was the
+          * cause of a stall: printed only if the stall was reported and the
+          * wait then completed after the channels were rung again. */
+         if (kicked > 0) {
+            fprintf(stderr, "nvk/nvrm: CPU wait completed %.1f s in, after "
+                    "%u doorbell%s rung again, which points to a lost "
+                    "doorbell\n",
+                    (os_time_get_nano() - wait_start) / 1e9, kicked,
+                    kicked == 1 ? " was" : "s were");
+         }
          result = VK_SUCCESS;
          break;
       }
@@ -835,6 +863,13 @@ sync_wait_impl(struct nvkmd_nvrm_dev *dev,
          sync_wait_report_stuck(dev, waits, wait_count, wait_flags,
                                 (uint64_t)now - wait_start,
                                 reports++ % 6 == 0);
+         /* After the report, so it shows the state before the kick. */
+         uint32_t n = sync_kick_channels(dev);
+         if (n > 0) {
+            fprintf(stderr, "nvk/nvrm: rang the doorbell of %u channel%s "
+                    "with incomplete work again\n", n, n == 1 ? "" : "s");
+         }
+         kicked += n;
          next_report = (uint64_t)now + STUCK_EVERY_NS;
       }
 

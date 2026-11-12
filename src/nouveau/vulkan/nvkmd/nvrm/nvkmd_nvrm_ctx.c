@@ -64,6 +64,64 @@ extern const struct nvkmd_ctx_ops nvkmd_nvrm_bind_ctx_ops;
  * Shared GPFIFO channel
  */
 
+/* Memory barrier for handing work to the GPU host.
+ *
+ * A submit writes three kinds of memory, mapped three different ways:
+ *  - the pushbuffer and GPFIFO entries, in GART (sysmem, write-back cached,
+ *    snooped by the GPU);
+ *  - USERD GPPut, in vidmem through BAR1, which RM maps write-combined for
+ *    user mappings of FB memory (mapping_cpu.c, RmMapMemory);
+ *  - the doorbell, a register in the usermode page, mapped uncached.
+ *
+ * x86 keeps ordinary write-back stores in order, but write-combined stores
+ * are weakly ordered: they sit in a WC buffer and may reach the device after
+ * a later uncached store. Without a fence the doorbell can arrive before the
+ * new GPPut, the host then reads the old GPPut, finds nothing new, and the
+ * submission is left in the ring until some later doorbell. An application
+ * that keeps submitting hides this (the next frame's doorbell picks the work
+ * up); one that waits for the result of its last submission, or a channel
+ * that submits rarely, such as the upload queue's copy channel, waits
+ * forever.
+ *
+ * The compiler needs the barrier as much as the CPU: the GPFIFO entry and
+ * pushbuffer stores are plain stores, which C lets it move past the volatile
+ * GPPut and doorbell stores.
+ *
+ * NVIDIA's own submit path fences at both points: mb() between the GPFIFO
+ * entry and GPPut (uvm_channel.c, "Need to make sure all the pushbuffer and
+ * the GPFIFO entries writes complete before updating GPPUT"), and wmb()
+ * between GPPut and the doorbell (uvm_volta_host.c,
+ * uvm_hal_volta_host_write_gpu_put()). Mesa's amdgpu user-queue submit
+ * (amdgpu_cs.cpp) uses mfence the same way before its write pointer and its
+ * doorbell. mfence covers write-combined stores as well as ordinary ones,
+ * which a locked instruction (what a C11 seq_cst fence may compile to) is
+ * not documented to do for device memory, so use it explicitly. */
+static inline void
+chan_io_barrier(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	__asm__ volatile("mfence" ::: "memory");
+#elif defined(__aarch64__)
+	__asm__ volatile("dsb st" ::: "memory");
+#else
+	__sync_synchronize();
+#endif
+}
+
+/* Tell the host the channel has new work. Re-reads GPPut from USERD, so
+ * ringing it again with no new work is harmless. */
+static void
+chan_ring_doorbell(struct nvkmd_nvrm_channel *chan)
+{
+	struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(chan->dev->base.pdev);
+	const volatile NvNotification *notifiers = chan->notifier->map;
+	volatile NvU32 *doorbell = (volatile NvU32 *)
+		((NvU8 *)pdev->usermodeMap.address + NVC361_NOTIFY_CHANNEL_PENDING);
+
+	chan_io_barrier();
+	*doorbell = notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN].info32;
+}
+
 /* Completed-fence value: the highest wSeq the GPU has released into chan->sem. */
 static uint64_t
 chan_completed(struct nvkmd_nvrm_channel *chan)
@@ -72,7 +130,8 @@ chan_completed(struct nvkmd_nvrm_channel *chan)
 }
 
 /* Report a channel wait that has run for seconds: the fence it needs, what
- * the GPU has completed, and where the GPFIFO stands. GPGet stuck short of
+ * the GPU has completed, and where the GPFIFO stands, then ring the doorbell
+ * again. GPGet stuck short of
  * GPPut with no RC error usually means the GPU is parked on a semaphore
  * acquire whose signal never came. */
 static void
@@ -85,6 +144,9 @@ chan_report_stuck(struct nvkmd_nvrm_channel *chan, const char *what,
 	        ", GPGet %u GPPut %u\n",
 	        what, waited_ns / 1e9, target, chan_completed(chan), chan->wSeq,
 	        (unsigned)userD->GPGet, (unsigned)userD->GPPut);
+	/* In case the stall is a lost doorbell (see chan_io_barrier()): ringing
+	 * it again is harmless, and if the wait then ends, that was the cause. */
+	chan_ring_doorbell(chan);
 }
 
 /* True once RM has reported a robust-channel error on this channel. */
@@ -171,10 +233,13 @@ nvkmd_nvrm_channel_report(const struct nvkmd_nvrm_channel *chan)
 	uint64_t completed = nvkmd_nvrm_channel_completed(chan);
 	uint32_t rc = nvkmd_nvrm_channel_rc_status(chan);
 
+	/* USERD GPPut is what the host reads; "CPU" is what this process last
+	 * wrote there. If they differ, the GPPut write has not reached the GPU. */
 	fprintf(stderr, "nvk/nvrm:   %s channel %p: completed fence %" PRIu64
-	        " of %" PRIu64 " submitted, GPGet %u GPPut %u%s",
+	        " of %" PRIu64 " submitted, GPGet %u GPPut %u (CPU %u)%s",
 	        chan->kind ? chan->kind : "?", (const void *)chan, completed,
 	        chan->wSeq, (unsigned)userD->GPGet, (unsigned)userD->GPPut,
+	        (unsigned)(chan->gpPut % NVRM_CTX_GPFIFO_ENTRIES),
 	        completed >= chan->wSeq ? ", idle" : "");
 	if (rc != 0)
 		fprintf(stderr, ", RC ERROR status 0x%x (channel stopped)", rc);
@@ -182,6 +247,22 @@ nvkmd_nvrm_channel_report(const struct nvkmd_nvrm_channel *chan)
 
 	chan_report_sem_log(chan, true, completed);
 	chan_report_sem_log(chan, false, completed);
+}
+
+/* Ring the doorbell of a channel that has submitted work the GPU has not
+ * completed, for a CPU wait that has stalled. If the work then completes,
+ * the host had not been told about it: a doorbell was lost. Returns whether
+ * it rang. Caller holds dev->sync_mutex. */
+bool
+nvkmd_nvrm_channel_kick(struct nvkmd_nvrm_channel *chan)
+{
+	if (nvkmd_nvrm_channel_rc_status(chan) != 0)
+		return false;
+	if (nvkmd_nvrm_channel_completed(chan) >=
+	    __atomic_load_n(&chan->wSeq, __ATOMIC_ACQUIRE))
+		return false;
+	chan_ring_doorbell(chan);
+	return true;
 }
 
 static uint32_t
@@ -502,10 +583,6 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
                     struct nvkmd_nvrm_channel *chan,
                     struct vk_object_base *log_obj)
 {
-   struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
-
-   NvNotification *notifiers = chan->notifier->map;
-   NvNotification *submitTokenNotifier = &notifiers[NV_CHANNELGPFIFO_NOTIFICATION_TYPE_WORK_SUBMIT_TOKEN];
    KeplerBControlGPFifo *userD = chan->userD->map;
    uint64_t semAdrGpu = chan->sem->va->addr;
 
@@ -517,10 +594,12 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
    write_semaphore_release(&chan->push, semAdrGpu, chan->wSeq, true);
    chan_emit_push_segment(chan);
 
+   /* The pushbuffer and GPFIFO entries must be in memory before the host can
+    * see the new GPPut, and GPPut must be before the doorbell; see
+    * chan_io_barrier(). chan_ring_doorbell() supplies the second barrier. */
+   chan_io_barrier();
    userD->GPPut = chan->gpPut;
-
-   volatile NvU32 *doorbell = (void*)((NvU8*)pdev->usermodeMap.address + NVC361_NOTIFY_CHANNEL_PENDING);
-   *doorbell = submitTokenNotifier->info32;
+   chan_ring_doorbell(chan);
 
    chan->cmdBufSlotFence[chan->cmdBufCurSlot] = chan->wSeq;
    chan->cmdBufSlotGpPut[chan->cmdBufCurSlot] = (uint32_t)chan->gpPut;

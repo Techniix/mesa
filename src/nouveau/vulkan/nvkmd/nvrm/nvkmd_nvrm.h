@@ -327,6 +327,7 @@ void nvkmd_nvrm_sync_unregister_channel(struct nvkmd_nvrm_dev *dev,
 uint64_t nvkmd_nvrm_channel_completed(const struct nvkmd_nvrm_channel *chan);
 uint32_t nvkmd_nvrm_channel_rc_status(const struct nvkmd_nvrm_channel *chan);
 void nvkmd_nvrm_channel_report(const struct nvkmd_nvrm_channel *chan);
+bool nvkmd_nvrm_channel_kick(struct nvkmd_nvrm_channel *chan);
 const volatile uint64_t *nvkmd_nvrm_sync_cpu_word(struct vk_sync *sync);
 uint64_t nvkmd_nvrm_channel_retire_point(const struct nvkmd_nvrm_channel *chan);
 uint64_t nvkmd_nvrm_sync_gpu_signal_value(struct vk_sync *sync, uint64_t value);
