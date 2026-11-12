@@ -30,6 +30,9 @@
 #include "vk_physical_device.h"
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
+#ifdef __HAIKU__
+#include "wsi_common_renga.h"
+#endif
 
 #include "drm-uapi/drm_fourcc.h"
 
@@ -485,6 +488,18 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    VkResult result;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+
+#ifdef __HAIKU__
+   /* Renga: a headless surface the surface layer attached to a window. The
+    * frames go to the window's bitmap hook (wsi_common_renga.cpp). */
+   const struct wsi_renga_swapchain_bitmap_hook *renga_hook =
+      wsi_renga_find_bitmap_hook(pCreateInfo);
+   if (renga_hook != NULL && renga_hook->bitmap_hook != NULL) {
+      return wsi_renga_create_swapchain(device, wsi_device, pCreateInfo,
+                                        pAllocator, renga_hook->bitmap_hook,
+                                        swapchain_out);
+   }
+#endif
 
    int num_images = pCreateInfo->minImageCount;
 

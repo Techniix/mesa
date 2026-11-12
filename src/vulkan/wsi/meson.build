@@ -34,6 +34,15 @@ else
   files_vulkan_wsi += files('wsi_common_headless.c')
 endif
 
+# Renga: headless swapchains that present into a window through a bitmap
+# hook (wsi_common_renga.cpp). Renga reports itself as "haiku" to the build;
+# the code uses Renga-only interfaces, so this tree does not support stock
+# Haiku.
+if host_machine.system() == 'haiku'
+  files_vulkan_wsi += files('wsi_common_renga.cpp')
+  platform_deps += cpp.find_library('be')
+endif
+
 if with_platform_macos
   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
 endif
