@@ -160,8 +160,18 @@ static char *
 __getProgramName()
 {
    image_info info;
-   get_image_info(B_CURRENT_TEAM, &info);
-   return strdup(info.name);
+   int32 cookie = 0;
+   while (get_next_image_info(B_CURRENT_TEAM, &cookie, &info) == B_OK) {
+      if (info.type != B_APP_IMAGE)
+         continue;
+      char *progname = strrchr(info.name, '/');
+      if (progname)
+         progname++;
+      else
+         progname = info.name;
+      return strdup(progname);
+   }
+   return strdup("");
 }
 #else
 #define GET_PROGRAM_NAME_NOT_AVAILABLE

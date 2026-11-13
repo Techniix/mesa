@@ -201,6 +201,35 @@ option(
                 'will be built'
 )
 
+option(
+  'nvk-nvkmd-backend',
+  type : 'combo',
+  choices : ['auto', 'nvrm', 'nouveau'],
+  value : 'auto',
+  description : 'Kernel-mode backend for the NVK Vulkan driver: ' +
+                'nvrm (NVIDIA RM, Haiku) or nouveau (DRM/libdrm, Linux). ' +
+                'auto picks nvrm on Haiku and nouveau elsewhere.',
+)
+
+option(
+  'nvk-nvrm-source-path',
+  type : 'string',
+  value : '',
+  description : 'Path to a checkout of NVIDIA open-gpu-kernel-modules, used ' +
+                'for the nvrm nvkmd backend SDK headers. May be absolute or ' +
+                'relative to the source root. Required when ' +
+                'nvk-nvkmd-backend resolves to nvrm.',
+)
+
+option(
+  'nvk-nvrm-version',
+  type : 'string',
+  value : '570.86.16',
+  description : 'Expected NVIDIA RM (NVRM) driver version for the nvrm ' +
+                'nvkmd backend. Checked at driver load against the running ' +
+                'kernel module; a mismatch fails device enumeration.',
+)
+
 # Note that the freedreno gallium driver doesn't support KGSL.
 # On those systems, zink with Turnip should be used instead.
 # WSL is only supported for the replay tool.

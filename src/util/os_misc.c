@@ -482,6 +482,12 @@ os_get_available_system_memory(uint64_t *size)
 
    *size = ((uint64_t)vm_stats.free_count + (uint64_t)vm_stats.inactive_count) * PAGE_SIZE;
    return true;
+#elif DETECT_OS_HAIKU
+   system_info info;
+   if (get_system_info(&info) != B_OK)
+      return false;
+   *size = (info.max_pages - info.used_pages) * B_PAGE_SIZE;
+   return true;
 #else
    return false;
 #endif

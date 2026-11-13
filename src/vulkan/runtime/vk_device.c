@@ -41,6 +41,7 @@
 #include "util/perf/cpu_trace.h"
 #include "util/ralloc.h"
 #include "util/timespec.h"
+#include "util/compiler.h"
 
 /* Breaks linking cycles since WSI common depends on runtime,
  * and Meson does not allow runtime to depend on WSI common. */

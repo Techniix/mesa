@@ -311,6 +311,10 @@ with_imagination_vk = _vulkan_drivers.contains('imagination')
 with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
+nvk_nvkmd_backend = get_option('nvk-nvkmd-backend')
+if nvk_nvkmd_backend == 'auto'
+  nvk_nvkmd_backend = (host_machine.system() == 'haiku') ? 'nvrm' : 'nouveau'
+endif
 with_asahi_vk = _vulkan_drivers.contains('asahi')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
@@ -692,7 +696,13 @@ pre_args += '-DUSE_LIBGLVND=@0@'.format(with_glvnd.to_int())
 glvnd_vendor_name = get_option('glvnd-vendor-name')
 
 if with_vulkan_icd_dir == ''
-  with_vulkan_icd_dir = join_paths(get_option('datadir'), 'vulkan/icd.d')
+  if host_machine.system() == 'haiku'
+    # Haiku has no datadir-style Vulkan search path; ICDs live next to other
+    # add-ons. Relative path is resolved under $PREFIX at install time.
+    with_vulkan_icd_dir = 'add-ons/vulkan/icd.d'
+  else
+    with_vulkan_icd_dir = join_paths(get_option('datadir'), 'vulkan/icd.d')
+  endif
 endif
 
 with_dri2 = (with_dri or with_any_vk) and (with_dri_platform == 'drm' or with_dri_platform == 'apple' or  with_dri_platform == 'pseudo-drm')
@@ -799,11 +809,14 @@ endif
 
 allow_fallback_for_libdrm = get_option('allow-fallback-for').contains('libdrm')
 
+# NVK's nouveau back end needs libdrm; its RM back end (Haiku) does not.
+with_nvk_nouveau_backend = with_nouveau_vk and nvk_nvkmd_backend == 'nouveau'
+
 with_gallium_drisw_kms = false
-if system_has_kms_drm
+if system_has_kms_drm or with_nvk_nouveau_backend
   dep_libdrm = dependency(
     'libdrm', version : '>=' + _drm_ver,
-    required : with_dri2 or with_dri or with_gbm,
+    required : with_dri2 or with_dri or with_gbm or with_nvk_nouveau_backend,
     allow_fallback: allow_fallback_for_libdrm,
     default_options : {
       'auto_features' : 'disabled',
@@ -2544,6 +2557,10 @@ dir_source_root = meson.project_source_root()
 
 if host_machine.system() == 'windows'
   vulkan_icd_lib_path = import('fs').relative_to(get_option('bindir'), with_vulkan_icd_dir)
+elif host_machine.system() == 'haiku'
+  # The ICD library is installed next to its manifest, so reference it
+  # relative to the manifest directory ('./<lib>').
+  vulkan_icd_lib_path = '.'
 else
   vulkan_icd_lib_path = get_option('prefix') / get_option('libdir')
 endif

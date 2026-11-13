@@ -17,6 +17,10 @@
 #include "cl9097.h"
 #include "cl90c0.h"
 
+// WORKAROUND
+#undef TRUE
+#undef FALSE
+
 bool
 nvk_format_supports_atomics(const struct nvk_physical_device *pdev,
                             enum pipe_format p_format)

@@ -32,7 +32,7 @@ idep_nouveau_mme = declare_dependency(
   link_with : _libnouveau_mme,
 )
 
-if with_tests and not with_platform_android
+if with_tests and not with_platform_android and with_nvk_nouveau_backend
   test('mme_builder',
     executable(
       'mme_builder_test',
@@ -108,17 +108,19 @@ executable(
   install : with_tools.contains('nouveau'),
 )
 
-executable(
-  'nv_mme_method_dumper',
-  'nv_mme_method_dumper.c',
-  include_directories : [inc_include, inc_src],
-  dependencies : [
-    dep_libdrm,
-    idep_mesautil,
-    idep_nvidia_headers,
-    idep_nouveau_mme,
-    idep_nouveau_ws
-  ],
-  build_by_default : with_tools.contains('nouveau'),
-  install : with_tools.contains('nouveau'),
-)
+if with_nvk_nouveau_backend
+  executable(
+    'nv_mme_method_dumper',
+    'nv_mme_method_dumper.c',
+    include_directories : [inc_include, inc_src],
+    dependencies : [
+      dep_libdrm,
+      idep_mesautil,
+      idep_nvidia_headers,
+      idep_nouveau_mme,
+      idep_nouveau_ws
+    ],
+    build_by_default : with_tools.contains('nouveau'),
+    install : with_tools.contains('nouveau'),
+  )
+endif

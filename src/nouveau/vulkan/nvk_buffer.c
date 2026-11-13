@@ -240,6 +240,10 @@ nvk_GetPhysicalDeviceExternalBufferProperties(
       pExternalBufferProperties->externalMemoryProperties =
          nvk_dma_buf_mem_props;
       return;
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
+      pExternalBufferProperties->externalMemoryProperties =
+         nvk_host_pointer_mem_props;
+      return;
    default:
       goto unsupported;
    }

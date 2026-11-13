@@ -1,0 +1,89 @@
+/*
+ * Copyright © 2024 Collabora Ltd. and Red Hat Inc.
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "nvkmd_nvrm.h"
+
+#include "vk_log.h"
+
+#include "util/u_memory.h"
+#include "util/hash_table.h"
+
+#include "nvRmApi.h"
+
+#include "nvos.h"
+
+VkResult
+nvkmd_nvrm_create_dev(struct nvkmd_pdev *_pdev,
+                         struct vk_object_base *log_obj,
+                         struct nvkmd_dev **dev_out)
+{
+   struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(_pdev);
+
+   struct nvkmd_nvrm_dev *dev = CALLOC_STRUCT(nvkmd_nvrm_dev);
+   if (dev == NULL)
+      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   dev->base.ops = &nvkmd_nvrm_dev_ops;
+   dev->base.pdev = &pdev->base;
+
+   list_inithead(&dev->base.mems);
+   simple_mtx_init(&dev->base.mems_mutex, mtx_plain);
+   simple_mtx_init(&dev->sync_mutex, mtx_plain);
+   util_dynarray_init(&dev->sync_pages, NULL);
+   util_dynarray_init(&dev->sync_events, NULL);
+
+   dev->mappings = _mesa_hash_table_create(NULL, _mesa_hash_pointer, _mesa_key_pointer_equal);
+   if (dev->mappings == NULL) {
+   	  nvkmd_dev_destroy(&dev->base);
+      return vk_error(log_obj, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   *dev_out = &dev->base;
+
+   return VK_SUCCESS;
+}
+
+static void
+nvkmd_nvrm_dev_destroy(struct nvkmd_dev *_dev)
+{
+   struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_dev);
+   struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
+
+   nvkmd_nvrm_sync_pool_finish(dev);
+   simple_mtx_destroy(&dev->sync_mutex);
+
+   if (dev->mappings != NULL)
+      _mesa_hash_table_destroy(dev->mappings, NULL);
+
+   FREE(dev);
+}
+
+static inline uint64_t
+nvkmd_nvrm_dev_get_gpu_timestamp(struct nvkmd_dev *_dev)
+{
+   struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_dev);
+
+   return 0;
+}
+
+static int
+nvkmd_nvrm_dev_get_drm_fd(struct nvkmd_dev *_dev)
+{
+   struct nvkmd_nvrm_dev *dev = nvkmd_nvrm_dev(_dev);
+
+   return -1;
+}
+
+const struct nvkmd_dev_ops nvkmd_nvrm_dev_ops = {
+   .destroy = nvkmd_nvrm_dev_destroy,
+   .get_gpu_timestamp = nvkmd_nvrm_dev_get_gpu_timestamp,
+   .get_drm_fd = nvkmd_nvrm_dev_get_drm_fd,
+   .alloc_mem = nvkmd_nvrm_alloc_mem,
+   .alloc_tiled_mem = nvkmd_nvrm_alloc_tiled_mem,
+   .import_dma_buf = nvkmd_nvrm_import_dma_buf,
+   .import_userptr = nvkmd_nvrm_import_userptr,
+   .alloc_va = nvkmd_nvrm_alloc_va,
+   .create_ctx = nvkmd_nvrm_create_ctx,
+};

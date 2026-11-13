@@ -16,6 +16,9 @@
 #include <string.h>
 
 /* these symbols are not defined in the libelf lib used for android in CI */
+#ifndef EI_OSABI
+#define EI_OSABI	7
+#endif
 #ifndef ELF64_ST_VISIBILITY
 #define ELF64_ST_VISIBILITY(o)	((o)&0x3)
 #endif

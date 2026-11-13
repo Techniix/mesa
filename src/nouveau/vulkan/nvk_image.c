@@ -590,6 +590,18 @@ nvk_GetPhysicalDeviceImageFormatProperties2(
          ext_mem_props = &nvk_dma_buf_mem_props;
          break;
 
+      case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
+         /* Host-pointer imports back the image with the application's own
+          * linear CPU memory, so only linear tiling has a well-defined
+          * layout. DRM-modifier tiling could encode a tiled layout the host
+          * memory doesn't match, so restrict to plain linear here.
+          */
+         if (pImageFormatInfo->tiling != VK_IMAGE_TILING_LINEAR)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+         ext_mem_props = &nvk_host_pointer_mem_props;
+         break;
+
       default:
          /* From the Vulkan 1.3.256 spec:
           *

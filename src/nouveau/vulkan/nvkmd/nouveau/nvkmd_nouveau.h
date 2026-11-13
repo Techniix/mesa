@@ -37,6 +37,11 @@ VkResult nvkmd_nouveau_try_create_pdev(struct _drmDevice *drm_device,
                                        enum nvk_debug debug_flags,
                                        struct nvkmd_pdev **pdev_out);
 
+VkResult nvkmd_nouveau_enum_pdev(struct vk_object_base *log_obj,
+                                 enum nvk_debug debug_flags,
+                                 nvkmd_enum_pdev_visitor visitor,
+                                 void *arg);
+
 #define NVKMD_NOUVEAU_HEAP_START ((uint64_t)4096)
 #define NVKMD_NOUVEAU_HEAP_END ((uint64_t)(1ull << 38))
 #define NVKMD_NOUVEAU_REPLAY_HEAP_START NVKMD_NOUVEAU_HEAP_END

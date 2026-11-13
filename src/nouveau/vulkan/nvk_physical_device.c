@@ -31,7 +31,27 @@
 #include "vk_shader_module.h"
 #include "vulkan/wsi/wsi_common.h"
 
+#ifndef __HAIKU__
 #include <sys/sysmacros.h>
+#endif
+
+#ifdef __HAIKU__
+static unsigned int major(dev_t dev)
+{
+	unsigned int __major;
+	__major  = ((dev & (dev_t) 0x00000000000fff00u) >>  8);
+	__major |= ((dev & (dev_t) 0xfffff00000000000u) >> 32);
+	return __major;
+}
+
+static unsigned int minor(dev_t dev)
+{
+	unsigned int __minor;
+	__minor  = ((dev & (dev_t) 0x00000000000000ffu) >>  0);
+	__minor |= ((dev & (dev_t) 0x00000ffffff00000u) >> 12);
+	return __minor;
+}
+#endif
 
 #include "nv_push.h"
 #include "cl90c0.h"
@@ -112,6 +132,8 @@ static void
 nvk_get_device_extensions(const struct nvk_instance *instance,
                           const struct nv_device_info *info,
                           bool has_tiled_bos,
+                          bool has_userptr,
+                          bool has_map_fixed,
                           struct vk_device_extension_table *ext)
 {
    const bool h264dec = nvk_video_enabled(instance, info);
@@ -257,6 +279,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_external_memory_dma_buf = true,
+      .EXT_external_memory_host = has_userptr,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = true,
@@ -273,7 +296,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_line_rasterization = true,
       .EXT_load_store_op_none = true,
       .EXT_mesh_shader = info->cls_eng3d >= TURING_A,
-      .EXT_map_memory_placed = true,
+      .EXT_map_memory_placed = has_map_fixed,
       .EXT_memory_budget = true,
       .EXT_multi_draw = true,
       .EXT_mutable_descriptor_type = true,
@@ -726,9 +749,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       .legacyVertexAttributes = true,
 
       /* VK_EXT_map_memory_placed */
-      .memoryMapPlaced = true,
+      .memoryMapPlaced = supported_extensions->EXT_map_memory_placed,
       .memoryMapRangePlaced = false,
-      .memoryUnmapReserve = true,
+      .memoryUnmapReserve = supported_extensions->EXT_map_memory_placed,
 
       /* VK_EXT_mesh_shader */
       .taskShader = info->cls_eng3d >= TURING_A,
@@ -1026,6 +1049,10 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .maxMultiviewInstanceIndex = UINT32_MAX,
       .maxPerSetDescriptors = UINT32_MAX,
       .maxMemoryAllocationSize = (1u << 31),
+
+      /* VK_EXT_external_memory_host: the OS-descriptor import path requires a
+       * page-aligned host pointer. */
+      .minImportedHostPointerAlignment = os_page_size,
 
       /* Vulkan 1.2 properties */
       .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
@@ -1528,19 +1555,12 @@ nvk_get_vram_heap_available(struct nvk_physical_device *pdev)
    return pdev->info.vram_size_B - used;
 }
 
-VkResult
-nvk_create_drm_physical_device(struct vk_instance *_instance,
-                               struct _drmDevice *drm_device,
-                               struct vk_physical_device **pdev_out)
+static VkResult
+nvk_create_physical_device(struct nvkmd_pdev *nvkmd,
+                           void *arg)
 {
-   struct nvk_instance *instance = (struct nvk_instance *)_instance;
+   struct nvk_instance *instance = (struct nvk_instance *)arg;
    VkResult result;
-
-   struct nvkmd_pdev *nvkmd;
-   result = nvkmd_try_create_pdev_for_drm(drm_device, &instance->vk.base,
-                                          instance->debug_flags, &nvkmd);
-   if (result != VK_SUCCESS)
-      return result;
 
    /* We don't support anything pre-Kepler */
    if (nvkmd->dev_info.cls_eng3d < KEPLER_A) {
@@ -1583,6 +1603,8 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    struct vk_device_extension_table supported_extensions;
    nvk_get_device_extensions(instance, &nvkmd->dev_info,
                              nvkmd->kmd_info.has_alloc_tiled,
+                             nvkmd->kmd_info.has_userptr,
+                             nvkmd->kmd_info.has_map_fixed,
                              &supported_extensions);
 
    struct vk_features supported_features;
@@ -1744,7 +1766,7 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
       goto fail_disk_cache;
 #endif
 
-   *pdev_out = &pdev->vk;
+   list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
 
    return VK_SUCCESS;
 
@@ -1758,6 +1780,13 @@ fail_alloc:
 fail_nvkmd:
    nvkmd_pdev_destroy(nvkmd);
    return result;
+}
+
+VkResult
+nvk_enumarate_physical_devices(struct vk_instance *_instance)
+{
+   struct nvk_instance *instance = (struct nvk_instance *)_instance;
+   return nvkmd_enum_pdev(&instance->vk.base, instance->debug_flags, nvk_create_physical_device, instance);
 }
 
 void

@@ -39,6 +39,15 @@ const VkExternalMemoryProperties nvk_dma_buf_mem_props = {
       VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 };
 
+/* Host pointer import only: the pages are owned by the application, so the
+ * memory can be imported but never exported. */
+const VkExternalMemoryProperties nvk_host_pointer_mem_props = {
+   .externalMemoryFeatures =
+      VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT,
+   .compatibleHandleTypes =
+      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+};
+
 static enum nvkmd_mem_flags
 nvk_memory_type_flags(const VkMemoryType *type,
                       VkExternalMemoryHandleTypeFlagBits handle_types,
@@ -120,6 +129,37 @@ nvk_GetMemoryFdPropertiesKHR(VkDevice device,
    return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL
+nvk_GetMemoryHostPointerPropertiesEXT(
+   VkDevice device,
+   VkExternalMemoryHandleTypeFlagBits handleType,
+   const void *pHostPointer,
+   VkMemoryHostPointerPropertiesEXT *pMemoryHostPointerProperties)
+{
+   VK_FROM_HANDLE(nvk_device, dev, device);
+   const struct nvk_physical_device *pdev = nvk_device_physical(dev);
+
+   switch (handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT: {
+      /* Imported host memory is anonymous system memory, so it lands in
+       * host-visible GART. Report every memory type with that placement.
+       */
+      uint32_t type_bits = 0;
+      for (unsigned t = 0; t < ARRAY_SIZE(pdev->mem_types); t++) {
+         const VkMemoryType *type = &pdev->mem_types[t];
+         const enum nvkmd_mem_flags type_flags =
+            nvk_memory_type_flags(type, handleType, false);
+         if ((type_flags & NVKMD_MEM_GART) && (type_flags & NVKMD_MEM_CAN_MAP))
+            type_bits |= (1 << t);
+      }
+      pMemoryHostPointerProperties->memoryTypeBits = type_bits;
+      return VK_SUCCESS;
+   }
+   default:
+      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+   }
+}
+
 enum nvk_memory_init {
    NVK_MEMORY_INIT_NONE,
    NVK_MEMORY_INIT_ZERO,
@@ -144,6 +184,8 @@ nvk_AllocateMemory(VkDevice device,
 
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
+   const VkImportMemoryHostPointerInfoEXT *host_ptr_info =
+      vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_HOST_POINTER_INFO_EXT);
    const VkExportMemoryAllocateInfo *export_info =
       vk_find_struct_const(pAllocateInfo->pNext, EXPORT_MEMORY_ALLOCATE_INFO);
    const VkMemoryDedicatedAllocateInfo *dedicated_info =
@@ -156,6 +198,8 @@ nvk_AllocateMemory(VkDevice device,
       handle_types |= export_info->handleTypes;
    if (fd_info != NULL)
       handle_types |= fd_info->handleType;
+   if (host_ptr_info != NULL)
+      handle_types |= host_ptr_info->handleType;
 
    const bool not_shared = handle_types == 0;
    bool pinned_to_vram = false;
@@ -209,8 +253,10 @@ nvk_AllocateMemory(VkDevice device,
    const uint64_t aligned_size =
       align64(pAllocateInfo->allocationSize, alignment);
 
-   const bool is_import = fd_info && fd_info->handleType;
-   if (is_import) {
+   const bool is_fd_import = fd_info && fd_info->handleType;
+   const bool is_host_ptr_import = host_ptr_info && host_ptr_info->handleType;
+   const bool is_import = is_fd_import || is_host_ptr_import;
+   if (is_fd_import) {
       assert(fd_info->handleType ==
                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT ||
              fd_info->handleType ==
@@ -225,6 +271,15 @@ nvk_AllocateMemory(VkDevice device,
        * in from some other device.
        */
       assert(!(flags & ~mem->mem->flags & ~NVKMD_MEM_PLACEMENT_FLAGS));
+   } else if (is_host_ptr_import) {
+      assert(host_ptr_info->handleType ==
+               VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT);
+
+      result = nvkmd_dev_import_userptr(dev->nvkmd, &dev->vk.base,
+                                        host_ptr_info->pHostPointer,
+                                        aligned_size, flags, &mem->mem);
+      if (result != VK_SUCCESS)
+         goto fail_alloc;
    } else if (pte_kind != 0 || tile_mode != 0) {
       result = nvkmd_dev_alloc_tiled_mem(dev->nvkmd, &dev->vk.base,
                                          aligned_size, alignment,

@@ -161,10 +161,10 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    nvk_init_experimental_flags(instance);
    nvk_init_dri_options(instance);
 
-   instance->vk.physical_devices.try_create_for_drm =
-      nvk_create_drm_physical_device;
+   instance->vk.physical_devices.enumerate = nvk_enumarate_physical_devices;
    instance->vk.physical_devices.destroy = nvk_physical_device_destroy;
 
+#ifndef __HAIKU__
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(nvk_CreateInstance);
    if (!note) {
@@ -182,6 +182,7 @@ nvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
    copy_build_id_to_sha1(instance->driver_build_sha, note);
+#endif
 
    *pInstance = nvk_instance_to_handle(instance);
    return VK_SUCCESS;
