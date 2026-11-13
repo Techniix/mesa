@@ -184,7 +184,7 @@ struct nvkmd_nvrm_sem_record {
 
 struct nvkmd_nvrm_channel {
    struct nvkmd_nvrm_dev *dev;
-   const char *kind;  /* "exec", "copy" or "bind", for diagnostics */
+   const char *kind;  /* "exec", "copy", "vdec" or "bind", for diagnostics */
    struct nvkmd_nvrm_sem_record acqLog[NVRM_CHAN_SEM_LOG];
    struct nvkmd_nvrm_sem_record relLog[NVRM_CHAN_SEM_LOG];
    uint32_t acqLogNext;
@@ -228,6 +228,7 @@ struct nvkmd_nvrm_exec_ctx {
 	   NvHandle hEng3d;
 	   NvHandle hM2mf;
 	   NvHandle hCompute;
+	   NvHandle hVdec;	/* NVDEC object, on a video decode channel */
    } subchannels;
 };
 

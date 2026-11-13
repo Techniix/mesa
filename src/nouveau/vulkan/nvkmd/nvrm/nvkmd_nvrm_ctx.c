@@ -457,11 +457,14 @@ nvrm_channel_finish(struct nvkmd_nvrm_dev *dev, struct nvkmd_nvrm_channel *chan)
 
 /* Allocate and schedule a bare GPFIFO channel: the memories, context DMA,
  * channel, work-submit token and OS wake event, ready for host SEM methods.
- * Engine subchannel objects (if any) are the caller's responsibility. */
+ * Engine subchannel objects (if any) are the caller's responsibility.
+ * engineType is the RM engine the channel runs on (NV2080_ENGINE_TYPE_*):
+ * graphics for everything but video decode, which has its own engine. */
 static VkResult
 nvrm_channel_init(struct nvkmd_nvrm_dev *dev,
                   struct vk_object_base *log_obj,
-                  struct nvkmd_nvrm_channel *chan)
+                  struct nvkmd_nvrm_channel *chan,
+                  NvU32 engineType)
 {
    struct nvkmd_nvrm_pdev *pdev = nvkmd_nvrm_pdev(dev->base.pdev);
    struct nvkmd_dev *_dev = &dev->base;
@@ -496,7 +499,6 @@ nvrm_channel_init(struct nvkmd_nvrm_dev *dev,
 	};
    NV_CHECK(nvRmApiAlloc(&rm, pdev->hDevice, &chan->hCtxDma, NV01_CONTEXT_DMA, &ctxDmaParams));
 
-   NvU32 engineType = NV2080_ENGINE_TYPE_GRAPHICS;
 	NV_CHANNEL_ALLOC_PARAMS createChannelParams = {
 		.hObjectError  = chan->hCtxDma,
 		.gpFifoOffset  = chan->gpFifo->va->addr,
@@ -671,9 +673,39 @@ nvkmd_nvrm_create_exec_ctx(struct nvkmd_dev *_dev,
 
    ctx->base.ops = &nvkmd_nvrm_exec_ctx_ops;
    ctx->base.dev = &dev->base;
+   if (engines & NVKMD_ENGINE_VDEC) {
+      /* Video decode (Mesa 26.3, VK_KHR_video_decode_queue): its own
+       * channel on the NVDEC engine with the decoder object, as the nouveau
+       * winsys makes it (nouveau_ws_context_create() with
+       * NOUVEAU_WS_ENGINE_VDEC). NVK asks for it alone, for its video
+       * decode queue family; an NVDEC channel can't also carry graphics,
+       * so refuse a mix. The host semaphore methods the rest of this file
+       * emits are host (channel) methods and work on any engine's channel.
+       * NVDEC0 is the first decoder; GPUs with more decode on the first. */
+      if (engines & ~NVKMD_ENGINE_VDEC) {
+         vkRes = vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+                           "nvrm: video decode can't share a channel "
+                           "with engines %#x", engines & ~NVKMD_ENGINE_VDEC);
+         goto error;
+      }
+      if (pdev->base.dev_info.cls_vdec == 0) {
+         vkRes = vk_errorf(log_obj, VK_ERROR_FEATURE_NOT_PRESENT,
+                           "nvrm: no video decoder class on this GPU");
+         goto error;
+      }
+      ctx->chan.kind = "vdec";
+      VK_CHECK(nvrm_channel_init(dev, log_obj, &ctx->chan,
+                                 NV2080_ENGINE_TYPE_NVDEC0));
+      NV_CHECK(nvRmApiAlloc(&rm, ctx->chan.hChannel, &ctx->subchannels.hVdec,
+                            pdev->base.dev_info.cls_vdec, NULL));
+      *ctx_out = &ctx->base;
+      return VK_SUCCESS;
+   }
+
    ctx->chan.kind = engines == NVKMD_ENGINE_COPY ? "copy" : "exec";
 
-   VK_CHECK(nvrm_channel_init(dev, log_obj, &ctx->chan));
+   VK_CHECK(nvrm_channel_init(dev, log_obj, &ctx->chan,
+                              NV2080_ENGINE_TYPE_GRAPHICS));
 
    NV_CHECK(nvRmApiAlloc(&rm, ctx->chan.hChannel, &ctx->subchannels.hCopy, pdev->base.dev_info.cls_copy, NULL));
    NV_CHECK(nvRmApiAlloc(&rm, ctx->chan.hChannel, &ctx->subchannels.hEng2d, pdev->base.dev_info.cls_eng2d, NULL));
@@ -708,6 +740,8 @@ nvkmd_nvrm_exec_ctx_destroy(struct nvkmd_ctx *_ctx)
       nvRmApiFree(&rm, ctx->subchannels.hM2mf);
    if (ctx->subchannels.hCompute != 0)
       nvRmApiFree(&rm, ctx->subchannels.hCompute);
+   if (ctx->subchannels.hVdec != 0)
+      nvRmApiFree(&rm, ctx->subchannels.hVdec);
 
    nvrm_channel_finish(dev, &ctx->chan);
 
@@ -852,7 +886,8 @@ nvkmd_nvrm_create_bind_ctx(struct nvkmd_dev *_dev,
    util_dynarray_init(&ctx->signals, NULL);
    util_dynarray_init(&ctx->ops, NULL);
 
-   VK_CHECK(nvrm_channel_init(dev, log_obj, &ctx->chan));
+   VK_CHECK(nvrm_channel_init(dev, log_obj, &ctx->chan,
+                              NV2080_ENGINE_TYPE_GRAPHICS));
 
    /* The mapper and the channel rendezvous through this semsurf. 64-bit
     * semaphores are assumed (Turing+), so the channel's 64-bit SEM methods

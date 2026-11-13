@@ -42,6 +42,12 @@
 #include "class/clca6f.h"
 
 // DMA_COPY
+#include "class/clc4b0.h" // video decoder classes, Turing to Blackwell
+#include "class/clc6b0.h"
+#include "class/clc7b0.h"
+#include "class/clc9b0.h"
+#include "class/clcdb0.h"
+#include "class/clcfb0.h"
 #include "class/cla0b5.h"
 #include "class/clb0b5.h"
 #include "class/clc0b5.h"
@@ -138,6 +144,17 @@ static uint32_t sSubchannelCopyClasses[] = {
 	PASCAL_DMA_COPY_A,
 	MAXWELL_DMA_COPY_A,
 	KEPLER_DMA_COPY_A
+};
+
+/* NVDEC, newest first. Only Turing and later: NVK's video decode needs GSP
+ * (as the nouveau path does), which is the only way Quasar runs anyway. */
+static uint32_t sVideoDecoderClasses[] = {
+	NVCFB0_VIDEO_DECODER,	/* Blackwell GB20x */
+	NVCDB0_VIDEO_DECODER,	/* Blackwell GB10x */
+	NVC9B0_VIDEO_DECODER,	/* Ada */
+	NVC7B0_VIDEO_DECODER,	/* Ampere GA10x */
+	NVC6B0_VIDEO_DECODER,	/* Ampere GA100 */
+	NVC4B0_VIDEO_DECODER,	/* Turing */
 };
 
 static uint32_t sSubchannelEng2dClasses[] = {
@@ -310,6 +327,29 @@ nvkmd_nvrm_pdev_find_supported_class(struct nvkmd_nvrm_pdev *pdev, uint32_t numC
  * winsys isn't linked here, so this is a faithful port. NAK indexes
  * sm_smem_sizes_kB[] when filling a compute QMD and reads max_smem_per_wg_kB;
  * leaving the table empty makes it panic on the first dispatch. */
+/* Thread blocks resident per SM, for nv_device_info::max_blocks_per_mp
+ * (Mesa 26.3). Same table as max_blocks_per_mp_for_sm() in the nouveau
+ * winsys (nouveau_device.c), which isn't linked here; values from the CUDA
+ * programming guide's "Compute Capabilities". */
+static uint8_t
+nvkmd_nvrm_max_blocks_per_mp(uint8_t sm)
+{
+   switch (sm) {
+   case 10: case 11: case 12: case 13: case 20: case 21:
+      return 8;
+   case 30: case 32: case 35: case 37: case 75: case 86: case 87:
+      return 16;
+   case 89: case 110: case 120:
+      return 24;
+   case 50: case 52: case 53: case 60: case 61: case 62: case 70: case 72:
+   case 80: case 90: case 100:
+      return 32;
+   default:
+      /* The smallest known value, as the nouveau winsys does. */
+      return 8;
+   }
+}
+
 static void
 nvkmd_nvrm_init_shared_mem_sizes(struct nv_device_info *info)
 {
@@ -519,17 +559,23 @@ nvkmd_nvrm_create_pdev(struct vk_object_base *log_obj,
     .tpc_count = tpcCount,
     .mp_per_tpc = smPerTpc,
     .max_warps_per_mp = warpsPerSm,
+    .max_blocks_per_mp = nvkmd_nvrm_max_blocks_per_mp(sm),
     .cls_copy    = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelCopyClasses), sSubchannelCopyClasses),
     .cls_eng2d   = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelEng2dClasses), sSubchannelEng2dClasses),
     .cls_eng3d   = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelEng3dClasses), sSubchannelEng3dClasses),
     .cls_m2mf    = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelM2mfClasses), sSubchannelM2mfClasses),
     .cls_compute = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sSubchannelComputeClasses), sSubchannelComputeClasses),
+    /* RM lists a class only for engines the GPU has, so a decoder class
+     * means the chip has NVDEC. NVK still offers video decode only with
+     * NVK_EXPERIMENTAL=video (nvk_video_enabled()). */
+    .cls_vdec    = nvkmd_nvrm_pdev_find_supported_class(pdev, ARRAY_SIZE(sVideoDecoderClasses), sVideoDecoderClasses),
     .vram_size_B = vramSize,
     .bar_size_B  = bar1Size,
     .nc_atom_size_B = util_cache_granularity()
    };
 
    nvkmd_nvrm_init_shared_mem_sizes(&pdev->base.dev_info);
+   pdev->base.dev_info.has_video = pdev->base.dev_info.cls_vdec != 0;
 
    // TODO: bounds check
    strcpy(pdev->base.dev_info.device_name, getNameParams.gpuNameString.ascii);
