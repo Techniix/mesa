@@ -96,8 +96,11 @@ else
     # Instruct users of this library to link with --whole-archive.  Otherwise,
     # our weak function overloads may not resolve properly.
     link_whole : libvulkan_wsi,
+    # platform_deps too: libbe for the Renga WSI. As a dependency of the
+    # static library only, -lbe did not reach the driver's link line and
+    # libvulkan_nouveau.so failed with undefined BBitmap/BScreen symbols.
     dependencies : [
-      idep_vulkan_wsi_headers, dep_libudev
+      idep_vulkan_wsi_headers, dep_libudev, platform_deps
     ]
   )
 endif
