@@ -336,6 +336,13 @@ if with_platform_haiku
   deps_for_libmesa_util += dep_network
 endif
 
+# Renga provides inotify, which fossilize_db.c uses when sys/inotify.h is
+# found, in libgnu rather than libroot. Link it explicitly: NVK only linked
+# so far because the Rust standard library happens to add -lgnu.
+if host_machine.system() == 'haiku' and cc.check_header('sys/inotify.h')
+  deps_for_libmesa_util += cc.find_library('gnu')
+endif
+
 if with_perfetto
   files_mesa_util += files(
     'perf/u_perfetto.cc',
