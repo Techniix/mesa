@@ -118,6 +118,10 @@ driver_zink = declare_dependency(
   compile_args : '-DGALLIUM_ZINK',
   link_with : zink_deps,
   link_args : zink_link_args,
+  # zink_screen.c reads driconf (driParseConfigFiles, driQueryOptionb).
+  # Other loaders link xmlconfig through the DRI frontend; Haiku's EGL
+  # driver links Zink without one.
+  dependencies : idep_xmlconfig,
 )
 
 if with_tests
