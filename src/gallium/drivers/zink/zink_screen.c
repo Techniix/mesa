@@ -62,6 +62,10 @@
 #endif
 #endif
 
+#ifdef __HAIKU__
+#define RTLD_NOLOAD 0
+#endif
+
 static int num_screens = 0;
 bool zink_tracing = false;
 

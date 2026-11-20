@@ -19,7 +19,7 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
- * 
+ *
  * Authors:
  *    Mike Blumenkrantz <michael.blumenkrantz@gmail.com>
  */
@@ -76,7 +76,8 @@ struct kopper_swapchain {
 enum kopper_type {
    KOPPER_X11,
    KOPPER_WAYLAND,
-   KOPPER_WIN32
+   KOPPER_WIN32,
+   KOPPER_HAIKU
 };
 
 struct kopper_displaytarget
@@ -197,6 +198,9 @@ void
 zink_kopper_prune_batch_usage(struct kopper_displaytarget *cdt, const struct zink_batch_usage *u);
 void
 zink_kopper_set_readback_needs_update(struct zink_resource *res);
+
+VkResult
+zink_kopper_create_surface_haiku(struct zink_screen *screen, struct kopper_loader_info *info, VkSurfaceKHR *surface);
 
 #ifdef __cplusplus
 }
