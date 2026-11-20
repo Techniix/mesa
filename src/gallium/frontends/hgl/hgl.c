@@ -148,8 +148,11 @@ hgl_st_framebuffer_validate_textures(struct pipe_frontend_drawable *drawable,
 					/* Covers the case where we have already created a drawable that
 					* then got swapped and now we have to make a new back buffer.
 					* For Zink, we just alias the front buffer in that case.
+					* Only Zink (resource_create_drawable) works this way; the
+					* software rasterisers keep a display target per buffer.
 					*/
-					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT])
+					if (i == ST_ATTACHMENT_BACK_LEFT && buffer->textures[ST_ATTACHMENT_FRONT_LEFT]
+						&& buffer->screen->resource_create_drawable)
 						bind &= ~PIPE_BIND_DISPLAY_TARGET;
 #endif
 					if (!has_window)

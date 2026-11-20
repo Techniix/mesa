@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <algorithm>
 
@@ -44,6 +45,7 @@
 #include "pipe/p_defines.h"
 #include "state_tracker/st_context.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "mesa/glapi/glapi/glapi.h"
 
 #include "hgl/hgl_sw_winsys.h"
@@ -342,6 +344,37 @@ haiku_display_destroy(_EGLDisplay *disp)
    free(hgl_dpy);
 }
 
+/* The Gallium screen behind EGL on Haiku/Renga: Zink on the GPU's Vulkan
+ * driver when there is one (NVK on NVIDIA, through Quasar), otherwise the
+ * software rasteriser this Mesa was built with. Zink refuses CPU Vulkan
+ * devices (lavapipe) unless asked for one, so a machine without a GPU
+ * driver falls through to llvmpipe. GALLIUM_DRIVER (llvmpipe, softpipe)
+ * and LIBGL_ALWAYS_SOFTWARE choose the software path explicitly, as on
+ * other platforms. One build serves both, so a system Mesa can carry Zink. */
+static struct pipe_screen *
+haiku_create_screen(struct sw_winsys *winsys)
+{
+   const char *driver = debug_get_option("GALLIUM_DRIVER", "");
+   const bool software = debug_get_bool_option("LIBGL_ALWAYS_SOFTWARE", false) ||
+      (driver[0] != '\0' && strcmp(driver, "zink") != 0);
+
+#if defined(GALLIUM_ZINK)
+   if (!software) {
+      struct pipe_screen *screen = zink_create_screen(winsys, NULL);
+      if (screen != NULL)
+         return screen;
+      _eglLog(_EGL_INFO, "Haiku EGL: Zink found no Vulkan GPU, "
+              "using a software rasteriser");
+   }
+#endif
+#if defined(GALLIUM_LLVMPIPE) || defined(GALLIUM_SOFTPIPE)
+   return sw_screen_create(winsys);
+#else
+   (void)software;
+   return NULL;
+#endif
+}
+
 static EGLBoolean
 haiku_initialize_impl(_EGLDisplay *disp, void *platformDisplay)
 {
@@ -356,14 +389,12 @@ haiku_initialize_impl(_EGLDisplay *disp, void *platformDisplay)
    disp->DriverData = (void *)hgl_dpy;
 
    struct sw_winsys *winsys = hgl_create_sw_winsys();
-   // Renga: OpenGL is Zink on the GPU's Vulkan driver (NVK), never a
-   // software rasteriser.
-   struct pipe_screen *screen = zink_create_screen(winsys, NULL);
+   struct pipe_screen *screen = haiku_create_screen(winsys);
    if (screen == NULL) {
       winsys->destroy(winsys);
       free(hgl_dpy);
       disp->DriverData = NULL;
-      return _eglError(EGL_NOT_INITIALIZED, "eglInitialize: no Zink screen");
+      return _eglError(EGL_NOT_INITIALIZED, "eglInitialize: no Gallium screen");
    }
    hgl_dpy->disp = hgl_create_display(screen);
 
