@@ -629,9 +629,29 @@ nvrm_channel_submit(struct nvkmd_nvrm_dev *dev,
    return result;
 }
 
-/* Block until every submission on the channel has retired. */
+/* With NVK_DEBUG=push_sync, nvkmd_ctx_exec() syncs after every submission
+ * and prints the submission's push buffer if the sync fails. A hung
+ * submission never retires, so without a limit nothing would be printed:
+ * under push_sync the sync gives up after NVK_NVRM_PUSH_SYNC_TIMEOUT
+ * seconds (default 10) and reports the device lost, which makes NVK dump
+ * the commands that hung. Only for diagnosis; normal syncs wait forever. */
+static uint64_t
+push_sync_timeout_ns(void)
+{
+   static uint64_t timeout_ns;
+   if (timeout_ns == 0) {
+      const char *s = getenv("NVK_NVRM_PUSH_SYNC_TIMEOUT");
+      uint64_t seconds = s != NULL ? strtoull(s, NULL, 10) : 0;
+      timeout_ns = (seconds > 0 ? seconds : 10) * 1000000000ull;
+   }
+   return timeout_ns;
+}
+
+/* Block until every submission on the channel has retired, or for at most
+ * timeout_ns (UINT64_MAX: no limit; VK_TIMEOUT when it runs out). */
 static VkResult
-nvrm_channel_sync(struct nvkmd_nvrm_channel *chan, struct vk_object_base *log_obj)
+nvrm_channel_sync(struct nvkmd_nvrm_channel *chan, struct vk_object_base *log_obj,
+                  uint64_t timeout_ns)
 {
    const uint64_t wait_start = os_time_get_nano();
    uint64_t next_report = wait_start + 3000000000ull;
@@ -639,6 +659,13 @@ nvrm_channel_sync(struct nvkmd_nvrm_channel *chan, struct vk_object_base *log_ob
       if (chan_check_error(chan))
          return vk_error(log_obj, VK_ERROR_DEVICE_LOST);
       uint64_t now = os_time_get_nano();
+      if (timeout_ns != UINT64_MAX && now - wait_start >= timeout_ns) {
+         chan_report_stuck(chan, "push_sync", chan->wSeq, now - wait_start);
+         fprintf(stderr, "nvk/nvrm: push_sync: submission still running after "
+                 "%.0f s; reporting the device lost so NVK prints it\n",
+                 timeout_ns / 1e9);
+         return vk_error(log_obj, VK_ERROR_DEVICE_LOST);
+      }
       if (now >= next_report) {
          chan_report_stuck(chan, "channel sync", chan->wSeq, now - wait_start);
          next_report = now + 5000000000ull;
@@ -829,8 +856,13 @@ nvkmd_nvrm_exec_ctx_sync(struct nvkmd_ctx *_ctx,
    if (result != VK_SUCCESS)
       return result;
 
-   /* The explicit idle point: block until everything submitted has retired. */
-   return nvrm_channel_sync(&ctx->chan, log_obj);
+   /* The explicit idle point: block until everything submitted has retired.
+    * Under push_sync (a sync after every submission) with a limit, so a hung
+    * submission gets printed instead of waited on forever. */
+   const bool push_sync =
+      ctx->base.dev->pdev->debug_flags & NVK_DEBUG_PUSH_SYNC;
+   return nvrm_channel_sync(&ctx->chan, log_obj,
+                            push_sync ? push_sync_timeout_ns() : UINT64_MAX);
 }
 
 const struct nvkmd_ctx_ops nvkmd_nvrm_exec_ctx_ops = {
@@ -1223,7 +1255,7 @@ nvkmd_nvrm_bind_ctx_flush(struct nvkmd_ctx *_ctx,
             result = nvrm_channel_submit(dev, &ctx->chan, log_obj);
             if (result != VK_SUCCESS)
                goto done;
-            result = nvrm_channel_sync(&ctx->chan, log_obj);
+            result = nvrm_channel_sync(&ctx->chan, log_obj, UINT64_MAX);
             if (result != VK_SUCCESS)
                goto done;
          }
@@ -1276,7 +1308,7 @@ nvkmd_nvrm_bind_ctx_sync(struct nvkmd_ctx *_ctx,
    if (result != VK_SUCCESS)
       return result;
 
-   return nvrm_channel_sync(&ctx->chan, log_obj);
+   return nvrm_channel_sync(&ctx->chan, log_obj, UINT64_MAX);
 }
 
 const struct nvkmd_ctx_ops nvkmd_nvrm_bind_ctx_ops = {
